@@ -1,0 +1,7 @@
+.git
+data
+tests
+*.db
+*.db-shm
+*.db-wal
+npm-debug.log

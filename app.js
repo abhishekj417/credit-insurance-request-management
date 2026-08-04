@@ -1,0 +1,142 @@
+const DEFAULTS = {
+  statuses: [
+    { name: "Submitted to Finance", color: "blue", sla: 1 },
+    { name: "Documents Under Review", color: "orange", sla: 2 },
+    { name: "Returned—Documents Required", color: "red", sla: 3 },
+    { name: "Ready for COFACE Submission", color: "teal", sla: 1 },
+    { name: "Submitted to COFACE", color: "blue", sla: 5 },
+    { name: "Additional Information Required", color: "orange", sla: 3 },
+    { name: "Approved", color: "teal", sla: 0 },
+    { name: "Rejected", color: "red", sla: 0 },
+    { name: "Closed", color: "gray", sla: 0 }
+  ],
+  documents: [
+    { name: "Trade / commercial licence", required: true },
+    { name: "VAT certificate", required: true },
+    { name: "Buyer financial information", required: false }
+  ],
+  roles: [
+    { name: "Business requester", access: "Create & view own" },
+    { name: "Head of Distribution", access: "View business unit" },
+    { name: "Credit Insurance POC", access: "Review & manage" },
+    { name: "Finance stakeholder", access: "View all" },
+    { name: "Administrator", access: "Full access" }
+  ],
+  reminders: [
+    { event: "New request not reviewed", after: 1, recipient: "Credit Insurance POC" },
+    { event: "Documents still outstanding", after: 2, recipient: "Business requester" },
+    { event: "COFACE response overdue", after: 5, recipient: "Credit Insurance POC" },
+    { event: "Approval nearing expiry", after: 30, recipient: "Business requester" }
+  ],
+  requests: []
+};
+
+const clone = value => JSON.parse(JSON.stringify(value));
+let state = clone(DEFAULTS);
+let activeView = "dashboard";
+let adminTab = "statuses";
+
+async function api(path, options={}) {
+  const response = await fetch(path, { headers:{'Content-Type':'application/json',...(options.headers||{})}, ...options });
+  const payload = await response.json().catch(()=>({}));
+  if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+  return payload;
+}
+function money(value, currency="AED") { return new Intl.NumberFormat("en-AE", { style:"currency", currency, maximumFractionDigits:0 }).format(value); }
+function dateLabel(value) { return new Date(value + "T12:00:00").toLocaleDateString("en-GB", { day:"2-digit", month:"short", year:"numeric" }); }
+function statusColor(status) { return state.statuses.find(s => s.name === status)?.color || "gray"; }
+function isOverdue(request) { return new Date(request.due + "T23:59:00") < new Date() && !["Approved","Rejected","Closed"].includes(request.status); }
+function toast(message) { const el=document.createElement("div"); el.className="toast"; el.textContent=message; document.querySelector("#toastRoot").append(el); setTimeout(()=>el.remove(),2600); }
+
+function render() {
+  document.querySelector("#requestCount").textContent = state.requests.filter(r => !["Closed","Approved","Rejected"].includes(r.status)).length;
+  renderDashboard(); renderRequests(); renderAdmin();
+}
+
+function renderDashboard() {
+  const open=state.requests.filter(r=>!["Approved","Rejected","Closed"].includes(r.status));
+  const overdue=open.filter(isOverdue);
+  const missing=open.filter(r=>r.status.includes("Documents Required"));
+  const waiting=open.filter(r=>r.status.includes("COFACE") || r.status.includes("Information"));
+  document.querySelector("#dashboardView").innerHTML = `
+    <div class="metrics">
+      ${metric("Open requests",open.length,"↗",`${open.length} active across the business`)}
+      ${metric("Needs attention",overdue.length,"!",`<strong>${overdue.length} overdue</strong> action${overdue.length===1?"":"s"}`)}
+      ${metric("Awaiting COFACE",waiting.length,"⌛","External response pending")}
+      ${metric("Documents missing",missing.length,"▱","Waiting on business")}
+    </div>
+    <div class="dashboard-grid">
+      <div class="panel">
+        <div class="panel-header"><div><h2>Priority requests</h2><p>Items needing your attention or approaching their due date</p></div><button class="ghost-button" data-go="requests">View all →</button></div>
+        ${requestTable([...state.requests].sort((a,b)=>isOverdue(b)-isOverdue(a)).slice(0,5))}
+      </div>
+      <div class="panel">
+        <div class="panel-header"><div><h2>Recent activity</h2><p>Latest request updates</p></div></div>
+        <div class="action-list">
+          ${state.requests.slice(0,4).map((r,i)=>`<div class="action-item"><span class="action-symbol">${i===0?"✓":"↗"}</span><div><strong>${r.history[0]}</strong><p>${r.buyer} · ${r.id}</p><time>${i+1}h ago</time></div></div>`).join("")}
+        </div>
+      </div>
+    </div>`;
+}
+function metric(label,value,icon,note) { return `<div class="metric-card"><div class="metric-label">${label}<span class="metric-icon">${icon}</span></div><div class="metric-value">${value}</div><div class="metric-note">${note}</div></div>`; }
+function requestTable(requests) {
+  if (!requests.length) return `<div class="empty-state">No requests match this view.</div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Request / Buyer</th><th>Status</th><th>Requested limit</th><th>Owner</th><th>Due date</th></tr></thead><tbody>${requests.map(r=>`<tr class="clickable" data-request="${r.id}"><td class="company-cell"><strong>${r.buyer}</strong><small>${r.id} · ${r.unit}</small></td><td><span class="status status-${statusColor(r.status)}">${r.status}</span></td><td>${money(r.amount,r.currency)}</td><td>${r.owner}</td><td class="${isOverdue(r)?"due-over":""}">${dateLabel(r.due)}${isOverdue(r)?" · Overdue":""}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+function renderRequests() {
+  document.querySelector("#requestsView").innerHTML = `<div class="section-toolbar"><div class="search"><span>⌕</span><input id="requestSearch" placeholder="Search buyer, ID, owner or business unit"></div><select id="statusFilter" class="filter-select"><option value="">All statuses</option>${state.statuses.map(s=>`<option>${s.name}</option>`).join("")}</select></div><div class="panel" id="requestTablePanel">${requestTable(state.requests)}</div>`;
+}
+
+function renderAdmin() {
+  const tabs=[['statuses','Workflow statuses'],['documents','Document checklist'],['roles','Roles & access'],['reminders','Reminders & escalation']];
+  document.querySelector("#adminView").innerHTML=`<div class="admin-layout"><div class="panel admin-tabs">${tabs.map(t=>`<button class="admin-tab ${adminTab===t[0]?"active":""}" data-admin-tab="${t[0]}">${t[1]}</button>`).join("")}</div><div class="panel admin-content" id="adminContent">${adminPanel()}</div></div>`;
+}
+function adminPanel() {
+  if(adminTab==='statuses') return `<h2>Workflow statuses</h2><p>Define the stages, colour and expected turnaround time for every request.</p><div class="config-list">${state.statuses.map((s,i)=>`<div class="config-row"><span class="drag">⋮⋮</span><input type="text" value="${s.name}" data-field="name" data-index="${i}"><select data-field="color" data-index="${i}">${['teal','blue','orange','red','gray'].map(c=>`<option ${c===s.color?'selected':''}>${c}</option>`).join('')}</select><label>SLA <input type="number" min="0" value="${s.sla}" data-field="sla" data-index="${i}" style="width:55px"> days</label><button class="delete-row" data-delete="statuses" data-index="${i}">×</button></div>`).join('')}</div><button class="secondary-button add-row" data-add="statuses">＋ Add status</button>${saveBar()}`;
+  if(adminTab==='documents') return `<h2>Document checklist</h2><p>Choose which documents are mandatory before a request can be submitted.</p><div class="config-list">${state.documents.map((d,i)=>`<div class="config-row"><span class="drag">⋮⋮</span><input type="text" value="${d.name}" data-field="name" data-index="${i}"><label><input type="checkbox" ${d.required?'checked':''} data-field="required" data-index="${i}"> Required</label><button class="delete-row" data-delete="documents" data-index="${i}">×</button></div>`).join('')}</div><button class="secondary-button add-row" data-add="documents">＋ Add document</button>${saveBar()}`;
+  if(adminTab==='roles') return `<h2>Roles & access</h2><p>Configure who can create, review and oversee requests.</p><div class="config-list">${state.roles.map((r,i)=>`<div class="config-row"><input type="text" value="${r.name}" data-field="name" data-index="${i}"><select data-field="access" data-index="${i}">${['Create & view own','View business unit','Review & manage','View all','Full access'].map(a=>`<option ${a===r.access?'selected':''}>${a}</option>`).join('')}</select><button class="delete-row" data-delete="roles" data-index="${i}">×</button></div>`).join('')}</div><button class="secondary-button add-row" data-add="roles">＋ Add role</button>${saveBar()}`;
+  return `<h2>Reminders & escalation</h2><p>Set automatic follow-ups so that no request is forgotten in an inbox.</p><div class="config-list">${state.reminders.map((r,i)=>`<div class="config-row"><input type="text" value="${r.event}" data-field="event" data-index="${i}"><label>After <input type="number" min="1" value="${r.after}" data-field="after" data-index="${i}" style="width:55px"> days</label><select data-field="recipient" data-index="${i}">${state.roles.map(role=>`<option ${role.name===r.recipient?'selected':''}>${role.name}</option>`).join('')}</select><button class="delete-row" data-delete="reminders" data-index="${i}">×</button></div>`).join('')}</div><button class="secondary-button add-row" data-add="reminders">＋ Add reminder</button>${saveBar()}`;
+}
+function saveBar(){ return `<div class="save-bar"><button class="primary-button" id="saveConfig">Save configuration</button></div>`; }
+
+function showNewRequest() {
+  const docFields=state.documents.map((d,i)=>`<div class="form-group ${i>1?'full':''}"><label>${d.name}${d.required?' <span class="required">*</span>':''}</label><div class="upload-box">Drop a file here or choose from your device<input type="file" data-doc="${i}" ${d.required?'required':''}></div></div>`).join('');
+  modal(`<div class="modal"><form id="newRequestForm"><div class="modal-head"><div><h2>New credit insurance request</h2><p>Submit buyer details for finance review</p></div><button type="button" class="close-modal">×</button></div><div class="modal-body"><div class="form-grid"><div class="form-group full"><label>Buyer legal name <span class="required">*</span></label><input name="buyer" required></div><div class="form-group"><label>Country <span class="required">*</span></label><input name="country" required></div><div class="form-group"><label>Business unit <span class="required">*</span></label><input name="unit" required></div><div class="form-group"><label>Requested credit limit <span class="required">*</span></label><input name="amount" type="number" min="1" required></div><div class="form-group"><label>Currency</label><select name="currency"><option>AED</option><option>USD</option><option>EUR</option><option>SAR</option></select></div><div class="form-group"><label>Payment terms</label><input name="terms"></div><div class="form-group"><label>Requester</label><input value="Provided by corporate sign-in" disabled></div><div class="form-group full"><label>Business justification</label><textarea name="note"></textarea></div>${docFields}</div></div><div class="modal-foot"><button type="button" class="secondary-button close-modal">Cancel</button><button type="submit" class="primary-button">Submit request</button></div></form></div>`);
+}
+function showRequest(id) {
+  const r=state.requests.find(x=>x.id===id); if(!r)return;
+  modal(`<div class="modal wide"><div class="modal-head"><div><span class="eyebrow">${r.id}</span><h2>${r.buyer}</h2><p>${r.country} · ${r.unit}</p></div><button class="close-modal">×</button></div><div class="modal-body"><div class="detail-summary"><div class="detail-stat"><small>Current status</small><strong><span class="status status-${statusColor(r.status)}">${r.status}</span></strong></div><div class="detail-stat"><small>Requested limit</small><strong>${money(r.amount,r.currency)}</strong></div><div class="detail-stat"><small>Current owner</small><strong>${r.owner}</strong></div></div><div class="detail-grid"><div><div class="detail-section"><h3>Request details</h3><div class="info-grid"><div class="info-item"><small>Submitted by</small><strong>${r.requester}</strong></div><div class="info-item"><small>Submitted on</small><strong>${dateLabel(r.submitted)}</strong></div><div class="info-item"><small>Payment terms</small><strong>${r.terms}</strong></div><div class="info-item"><small>COFACE reference</small><strong>${r.coface}</strong></div></div></div><div class="detail-section"><h3>Business justification</h3><p style="color:var(--muted);font-size:11px;line-height:1.6">${r.note}</p></div><div class="detail-section"><h3>Activity history</h3><div class="timeline">${r.history.map((h,i)=>`<div class="timeline-item"><strong>${h}</strong><span>${i+1} day${i?'s':''} ago</span></div>`).join('')}</div></div></div><aside><div class="detail-section"><h3>Documents</h3>${state.documents.map((d,i)=>`<div class="document-item"><span>${d.name}</span><span class="document-state">${r.docs[i]?'✓ Received':'— Missing'}</span></div>`).join('')}</div><div class="detail-section"><h3>Move request</h3><select id="detailStatus" style="width:100%;padding:10px">${state.statuses.map(s=>`<option ${s.name===r.status?'selected':''}>${s.name}</option>`).join('')}</select><button class="primary-button" data-update-request="${r.id}" style="width:100%;margin-top:9px">Update status</button></div></aside></div></div></div>`);
+}
+function modal(html){ document.querySelector('#modalRoot').innerHTML=`<div class="modal-backdrop">${html}</div>`; }
+function closeModal(){ document.querySelector('#modalRoot').innerHTML=''; }
+
+document.addEventListener('click', async e => {
+  const nav=e.target.closest('[data-view]'); if(nav) switchView(nav.dataset.view);
+  if(e.target.closest('#newRequestButton')) showNewRequest();
+  if(e.target.closest('.close-modal') || e.target.classList.contains('modal-backdrop')) closeModal();
+  const row=e.target.closest('[data-request]'); if(row) showRequest(row.dataset.request);
+  const go=e.target.closest('[data-go]'); if(go) switchView(go.dataset.go);
+  const tab=e.target.closest('[data-admin-tab]'); if(tab){ adminTab=tab.dataset.adminTab; renderAdmin(); }
+  const del=e.target.closest('[data-delete]'); if(del){ state[del.dataset.delete].splice(Number(del.dataset.index),1); renderAdmin(); }
+  const add=e.target.closest('[data-add]'); if(add){ const key=add.dataset.add; const templates={statuses:{name:'New status',color:'gray',sla:1},documents:{name:'New document',required:false},roles:{name:'New role',access:'View all'},reminders:{event:'New reminder',after:1,recipient:state.roles[0]?.name||'Administrator'}}; state[key].push(templates[key]); renderAdmin(); }
+  if(e.target.closest('#saveConfig')){ captureConfig(); try { state[adminTab]=await api(`/api/config/${adminTab}`,{method:'PUT',body:JSON.stringify(state[adminTab])}); render(); toast('Configuration saved'); } catch(error){ toast(error.message); } }
+  const update=e.target.closest('[data-update-request]'); if(update){ try { const changed=await api(`/api/requests/${encodeURIComponent(update.dataset.updateRequest)}/status`,{method:'PATCH',body:JSON.stringify({status:document.querySelector('#detailStatus').value})}); const index=state.requests.findIndex(x=>x.id===changed.id); state.requests[index]=changed; closeModal(); render(); toast('Request status updated'); } catch(error){ toast(error.message); } }
+  if(e.target.closest('#mobileMenu')) document.querySelector('.sidebar').classList.toggle('open');
+  if(e.target.closest('#notificationButton')) toast('3 items need your attention');
+});
+document.addEventListener('submit', async e => {
+  if(e.target.id!=='newRequestForm')return; e.preventDefault(); const form=new FormData(e.target); const today=new Date(); const due=new Date(); due.setDate(today.getDate()+1); const next=String(Math.max(...state.requests.map(r=>Number(r.id.split('-').pop())))+1).padStart(3,'0');
+  const payload={buyer:form.get('buyer'),country:form.get('country'),unit:form.get('unit'),amount:Number(form.get('amount')),currency:form.get('currency'),terms:form.get('terms'),requester:form.get('requester'),note:form.get('note'),docs:state.documents.map((_,i)=>Boolean(e.target.querySelector(`[data-doc="${i}"]`)?.files.length))};
+  try { const created=await api('/api/requests',{method:'POST',body:JSON.stringify(payload)}); state.requests.unshift(created); closeModal(); render(); switchView('requests'); toast('Request submitted and POC notified'); } catch(error){ toast(error.message); }
+});
+document.addEventListener('input',e=>{ if(e.target.id==='requestSearch') filterRequests(); });
+document.addEventListener('change',e=>{ if(e.target.id==='statusFilter') filterRequests(); });
+function filterRequests(){ const q=(document.querySelector('#requestSearch')?.value||'').toLowerCase(); const status=document.querySelector('#statusFilter')?.value||''; const list=state.requests.filter(r=>(!status||r.status===status)&&[r.id,r.buyer,r.owner,r.unit].join(' ').toLowerCase().includes(q)); document.querySelector('#requestTablePanel').innerHTML=requestTable(list); }
+function captureConfig(){ document.querySelectorAll('#adminContent [data-field]').forEach(el=>{ const value=el.type==='checkbox'?el.checked:el.type==='number'?Number(el.value):el.value; state[adminTab][Number(el.dataset.index)][el.dataset.field]=value; }); }
+function switchView(view){ activeView=view; document.querySelectorAll('.view').forEach(v=>v.classList.remove('active')); document.querySelector(`#${view}View`).classList.add('active'); document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view)); const copy={dashboard:['CREDIT INSURANCE','Request overview'],requests:['REQUEST MANAGEMENT','All credit requests'],admin:['APPLICATION CONTROL','Administration']}; document.querySelector('#pageEyebrow').textContent=copy[view][0]; document.querySelector('#pageTitle').textContent=copy[view][1]; document.querySelector('.sidebar').classList.remove('open'); }
+async function init(){
+  try { state=await api('/api/bootstrap'); render(); }
+  catch(error){ render(); toast('Application service unavailable. Contact your administrator.'); }
+}
+init();

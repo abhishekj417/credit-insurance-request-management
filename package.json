@@ -1,0 +1,12 @@
+{
+  "name": "creditflow",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Credit insurance workflow frontend and API",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check app.js",
+    "test": "node --test tests/api.test.js"
+  },
+  "engines": { "node": ">=22.5" }
+}

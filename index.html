@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Corporate credit insurance request management" />
+  <title>Credit Insurance Requests</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#" aria-label="Credit insurance requests home">
+        <span class="brand-mark">CI</span>
+        <span><strong>Credit Insurance</strong><small>Request management</small></span>
+      </a>
+      <nav class="nav" aria-label="Main navigation">
+        <button class="nav-item active" data-view="dashboard"><span class="nav-icon">⌂</span>Overview</button>
+        <button class="nav-item" data-view="requests"><span class="nav-icon">▤</span>Requests <span id="requestCount" class="nav-count"></span></button>
+        <button class="nav-item" data-view="admin"><span class="nav-icon">⚙</span>Admin settings</button>
+      </nav>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <button class="mobile-menu" id="mobileMenu" aria-label="Open navigation">☰</button>
+          <span class="eyebrow" id="pageEyebrow">CREDIT INSURANCE</span>
+          <h1 id="pageTitle">Request overview</h1>
+        </div>
+        <div class="top-actions">
+          <button class="icon-button" id="notificationButton" aria-label="Notifications">♢<span class="notification-dot"></span></button>
+          <button class="primary-button" id="newRequestButton"><span>＋</span> New request</button>
+        </div>
+      </header>
+
+      <section id="dashboardView" class="view active"></section>
+      <section id="requestsView" class="view"></section>
+      <section id="adminView" class="view"></section>
+    </main>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toastRoot" class="toast-root" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

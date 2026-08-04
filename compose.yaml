@@ -1,0 +1,14 @@
+services:
+  credit-insurance:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "4173:4173"
+    environment:
+      AUTH_MODE: development
+      FRAME_ANCESTORS: "'self'"
+    volumes:
+      - credit-insurance-data:/app/data
+
+volumes:
+  credit-insurance-data:
