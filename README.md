@@ -23,6 +23,8 @@ For a one-command Windows start, run `start-local.ps1`. For container and Micros
 - Status transitions
 - Admin-managed workflow statuses and SLA targets
 - Admin-managed documents, roles and reminders
+- In-app notifications for new requests and workflow-stage changes
+- Automatic reminders for requests pending without action for more than three days
 - Responsive layout
 - REST API with server-side validation
 - SQLite persistence with WAL mode and indexed operational fields
@@ -31,6 +33,8 @@ For a one-command Windows start, run `start-local.ps1`. For container and Micros
 
 - `GET /api/health`
 - `GET /api/session`
+- `GET /api/notifications`
+- `PATCH /api/notifications/:id/read`
 - `GET /api/bootstrap`
 - `POST /api/requests`
 - `PATCH /api/requests/:id/status`

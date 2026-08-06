@@ -35,6 +35,7 @@ const clone = value => JSON.parse(JSON.stringify(value));
 let state = clone(DEFAULTS);
 let activeView = "dashboard";
 let adminTab = "statuses";
+let notifications = [];
 
 async function api(path, options={}) {
   const response = await fetch(path, { headers:{'Content-Type':'application/json',...(options.headers||{})}, ...options });
@@ -47,6 +48,8 @@ function dateLabel(value) { return new Date(value + "T12:00:00").toLocaleDateStr
 function statusColor(status) { return state.statuses.find(s => s.name === status)?.color || "gray"; }
 function isOverdue(request) { return new Date(request.due + "T23:59:00") < new Date() && !["Approved","Rejected","Closed"].includes(request.status); }
 function toast(message) { const el=document.createElement("div"); el.className="toast"; el.textContent=message; document.querySelector("#toastRoot").append(el); setTimeout(()=>el.remove(),2600); }
+function renderNotificationBadge(){ const count=notifications.filter(n=>!n.readAt).length; const badge=document.querySelector('#notificationBadge'); badge.textContent=count; badge.hidden=count===0; }
+async function loadNotifications(){ try { notifications=await api('/api/notifications'); renderNotificationBadge(); } catch {} }
 
 function render() {
   document.querySelector("#requestCount").textContent = state.requests.filter(r => !["Closed","Approved","Rejected"].includes(r.status)).length;
@@ -109,6 +112,10 @@ function showRequest(id) {
   modal(`<div class="modal wide"><div class="modal-head"><div><span class="eyebrow">${r.id}</span><h2>${r.buyer}</h2><p>${r.country} · ${r.unit}</p></div><button class="close-modal">×</button></div><div class="modal-body"><div class="detail-summary"><div class="detail-stat"><small>Current status</small><strong><span class="status status-${statusColor(r.status)}">${r.status}</span></strong></div><div class="detail-stat"><small>Requested limit</small><strong>${money(r.amount,r.currency)}</strong></div><div class="detail-stat"><small>Current owner</small><strong>${r.owner}</strong></div></div><div class="detail-grid"><div><div class="detail-section"><h3>Request details</h3><div class="info-grid"><div class="info-item"><small>Submitted by</small><strong>${r.requester}</strong></div><div class="info-item"><small>Submitted on</small><strong>${dateLabel(r.submitted)}</strong></div><div class="info-item"><small>Payment terms</small><strong>${r.terms}</strong></div><div class="info-item"><small>COFACE reference</small><strong>${r.coface}</strong></div></div></div><div class="detail-section"><h3>Business justification</h3><p style="color:var(--muted);font-size:11px;line-height:1.6">${r.note}</p></div><div class="detail-section"><h3>Activity history</h3><div class="timeline">${r.history.map((h,i)=>`<div class="timeline-item"><strong>${h}</strong><span>${i+1} day${i?'s':''} ago</span></div>`).join('')}</div></div></div><aside><div class="detail-section"><h3>Documents</h3>${state.documents.map((d,i)=>`<div class="document-item"><span>${d.name}</span><span class="document-state">${r.docs[i]?'✓ Received':'— Missing'}</span></div>`).join('')}</div><div class="detail-section"><h3>Move request</h3><select id="detailStatus" style="width:100%;padding:10px">${state.statuses.map(s=>`<option ${s.name===r.status?'selected':''}>${s.name}</option>`).join('')}</select><button class="primary-button" data-update-request="${r.id}" style="width:100%;margin-top:9px">Update status</button></div></aside></div></div></div>`);
 }
 function modal(html){ document.querySelector('#modalRoot').innerHTML=`<div class="modal-backdrop">${html}</div>`; }
+function notificationTime(value){ return new Date(value.replace(' ','T')+'Z').toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}); }
+function showNotifications(){
+  modal(`<div class="modal"><div class="modal-head"><div><h2>Notifications</h2><p>Request updates and pending-action reminders</p></div><button class="close-modal">×</button></div><div class="modal-body"><div class="notification-list">${notifications.length?notifications.map(n=>`<div class="notification-item ${n.type==='reminder'?'reminder':''} ${n.readAt?'':'unread'}"><span class="notification-type"></span><div class="notification-copy"><strong>${n.title}</strong><p>${n.message}</p><time>${notificationTime(n.createdAt)}</time></div>${n.readAt?'':`<button class="mark-read" data-read-notification="${n.id}">Mark read</button>`}</div>`).join(''):'<div class="empty-state">No notifications.</div>'}</div></div></div>`);
+}
 function closeModal(){ document.querySelector('#modalRoot').innerHTML=''; }
 
 document.addEventListener('click', async e => {
@@ -123,12 +130,13 @@ document.addEventListener('click', async e => {
   if(e.target.closest('#saveConfig')){ captureConfig(); try { state[adminTab]=await api(`/api/config/${adminTab}`,{method:'PUT',body:JSON.stringify(state[adminTab])}); render(); toast('Configuration saved'); } catch(error){ toast(error.message); } }
   const update=e.target.closest('[data-update-request]'); if(update){ try { const changed=await api(`/api/requests/${encodeURIComponent(update.dataset.updateRequest)}/status`,{method:'PATCH',body:JSON.stringify({status:document.querySelector('#detailStatus').value})}); const index=state.requests.findIndex(x=>x.id===changed.id); state.requests[index]=changed; closeModal(); render(); toast('Request status updated'); } catch(error){ toast(error.message); } }
   if(e.target.closest('#mobileMenu')) document.querySelector('.sidebar').classList.toggle('open');
-  if(e.target.closest('#notificationButton')) toast('3 items need your attention');
+  if(e.target.closest('#notificationButton')){ await loadNotifications(); showNotifications(); }
+  const readNotification=e.target.closest('[data-read-notification]'); if(readNotification){ try { await api(`/api/notifications/${readNotification.dataset.readNotification}/read`,{method:'PATCH',body:'{}'}); await loadNotifications(); showNotifications(); } catch(error){ toast(error.message); } }
 });
 document.addEventListener('submit', async e => {
   if(e.target.id!=='newRequestForm')return; e.preventDefault(); const form=new FormData(e.target); const today=new Date(); const due=new Date(); due.setDate(today.getDate()+1); const next=String(Math.max(...state.requests.map(r=>Number(r.id.split('-').pop())))+1).padStart(3,'0');
   const payload={buyer:form.get('buyer'),country:form.get('country'),unit:form.get('unit'),amount:Number(form.get('amount')),currency:form.get('currency'),terms:form.get('terms'),requester:form.get('requester'),note:form.get('note'),docs:state.documents.map((_,i)=>Boolean(e.target.querySelector(`[data-doc="${i}"]`)?.files.length))};
-  try { const created=await api('/api/requests',{method:'POST',body:JSON.stringify(payload)}); state.requests.unshift(created); closeModal(); render(); switchView('requests'); toast('Request submitted and POC notified'); } catch(error){ toast(error.message); }
+  try { const created=await api('/api/requests',{method:'POST',body:JSON.stringify(payload)}); state.requests.unshift(created); await loadNotifications(); closeModal(); render(); switchView('requests'); toast('Request submitted and finance notified'); } catch(error){ toast(error.message); }
 });
 document.addEventListener('input',e=>{ if(e.target.id==='requestSearch') filterRequests(); });
 document.addEventListener('change',e=>{ if(e.target.id==='statusFilter') filterRequests(); });
@@ -136,7 +144,7 @@ function filterRequests(){ const q=(document.querySelector('#requestSearch')?.va
 function captureConfig(){ document.querySelectorAll('#adminContent [data-field]').forEach(el=>{ const value=el.type==='checkbox'?el.checked:el.type==='number'?Number(el.value):el.value; state[adminTab][Number(el.dataset.index)][el.dataset.field]=value; }); }
 function switchView(view){ activeView=view; document.querySelectorAll('.view').forEach(v=>v.classList.remove('active')); document.querySelector(`#${view}View`).classList.add('active'); document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view)); const copy={dashboard:['CREDIT INSURANCE','Request overview'],requests:['REQUEST MANAGEMENT','All credit requests'],admin:['APPLICATION CONTROL','Administration']}; document.querySelector('#pageEyebrow').textContent=copy[view][0]; document.querySelector('#pageTitle').textContent=copy[view][1]; document.querySelector('.sidebar').classList.remove('open'); }
 async function init(){
-  try { state=await api('/api/bootstrap'); render(); }
+  try { state=await api('/api/bootstrap'); await loadNotifications(); render(); }
   catch(error){ render(); toast('Application service unavailable. Contact your administrator.'); }
 }
 init();

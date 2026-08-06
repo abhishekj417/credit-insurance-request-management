@@ -43,6 +43,21 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
   CREATE INDEX IF NOT EXISTS idx_requests_due_date ON requests(due_date);
+  CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT UNIQUE,
+    recipient_user TEXT,
+    recipient_role TEXT,
+    request_id TEXT,
+    notification_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    read_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(recipient_user, read_at);
+  CREATE INDEX IF NOT EXISTS idx_notifications_role ON notifications(recipient_role, read_at);
 `);
 
 const seed = {
@@ -93,6 +108,28 @@ function getBootstrap() {
   output.requests = db.prepare('SELECT * FROM requests ORDER BY submitted_date DESC, id DESC').all().map(mapRequest);
   return output;
 }
+function addNotification({eventKey=null,user=null,role=null,requestId=null,type,title,message}) {
+  db.prepare(`INSERT OR IGNORE INTO notifications
+    (event_key,recipient_user,recipient_role,request_id,notification_type,title,message)
+    VALUES (?,?,?,?,?,?,?)`).run(eventKey,user,role,requestId,type,title,message);
+}
+function getNotifications(user) {
+  const roles=user.roles.length ? user.roles : ['__none__'];
+  const placeholders=roles.map(()=>'?').join(',');
+  return db.prepare(`SELECT id,request_id AS requestId,notification_type AS type,title,message,read_at AS readAt,created_at AS createdAt
+    FROM notifications WHERE recipient_user=? OR recipient_role IN (${placeholders}) ORDER BY created_at DESC LIMIT 50`).all(user.name,...roles);
+}
+function processPendingReminders() {
+  const pending=db.prepare(`SELECT id,buyer,status,requester FROM requests
+    WHERE status NOT IN ('Approved','Rejected','Closed') AND datetime(updated_at) <= datetime('now','-3 days')`).all();
+  const period=new Date().toISOString().slice(0,10);
+  for (const request of pending) {
+    addNotification({eventKey:`pending:${request.id}:${period}`,role:'Finance Reviewer',requestId:request.id,type:'reminder',
+      title:'Request pending for more than 3 days',message:`${request.id} - ${request.buyer} is still at ${request.status}. Review the next required action.`});
+    if (request.status.includes('Documents Required') || request.status.includes('Information Required')) addNotification({eventKey:`pending-requester:${request.id}:${period}`,user:request.requester,requestId:request.id,type:'reminder',title:'Your action is pending',message:`${request.id} - ${request.buyer} has been awaiting information for more than 3 days.`});
+  }
+  return pending.length;
+}
 function send(res, status, payload, headers={}) {
   const body = payload === null ? '' : JSON.stringify(payload);
   res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store', ...headers });
@@ -137,6 +174,7 @@ function createRequest(input, user) {
     history:[`Request submitted by ${user.name}`] };
   db.prepare(`INSERT INTO requests (id,buyer,country,business_unit,amount,currency,payment_terms,status,owner,requester,due_date,submitted_date,coface_reference,approved_amount,note,documents_json,history_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(request.id,request.buyer,request.country,request.unit,request.amount,request.currency,request.terms,request.status,request.owner,request.requester,request.due,request.submitted,request.coface,request.approved,request.note,JSON.stringify(request.docs),JSON.stringify(request.history));
+  addNotification({eventKey:`created:${request.id}`,role:'Finance Reviewer',requestId:request.id,type:'new_request',title:'New credit insurance request',message:`${request.id} - ${request.buyer} has been submitted for finance review.`});
   return request;
 }
 function updateStatus(id, status) {
@@ -146,13 +184,26 @@ function updateStatus(id, status) {
   if (!row) throw Object.assign(new Error('Request not found'),{status:404});
   const history = parseJson(row.history_json); history.unshift(`Status changed to ${status}`);
   db.prepare("UPDATE requests SET status=?, history_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status,JSON.stringify(history),id);
-  return mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));
+  const changed=mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));
+  const eventTime=Date.now();
+  addNotification({eventKey:`status:${id}:${eventTime}`,user:changed.requester,requestId:id,type:'status_change',title:'Request stage updated',message:`${id} - ${changed.buyer} moved from ${row.status} to ${status}.`});
+  if (status.includes('Documents Required') || status.includes('Information Required')) addNotification({eventKey:`action:${id}:${eventTime}`,user:changed.requester,requestId:id,type:'action_required',title:'Action required',message:`${id} - ${changed.buyer} requires additional information or documents.`});
+  return changed;
 }
 
 async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{status:'ok',database:'connected'});
   const user=getUser(req);
   if (req.method==='GET' && url.pathname==='/api/session') return send(res,200,user);
+  if (req.method==='GET' && url.pathname==='/api/notifications') { processPendingReminders(); return send(res,200,getNotifications(user)); }
+  const notificationMatch=url.pathname.match(/^\/api\/notifications\/(\d+)\/read$/);
+  if (req.method==='PATCH' && notificationMatch) {
+    const notification=db.prepare('SELECT recipient_user,recipient_role FROM notifications WHERE id=?').get(Number(notificationMatch[1]));
+    if (!notification) throw Object.assign(new Error('Notification not found'),{status:404});
+    if (notification.recipient_user!==user.name && !user.roles.includes(notification.recipient_role)) throw Object.assign(new Error('You do not have permission to update this notification'),{status:403});
+    db.prepare('UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE id=?').run(Number(notificationMatch[1]));
+    return send(res,200,{ok:true});
+  }
   if (req.method==='GET' && url.pathname==='/api/bootstrap') return send(res,200,getBootstrap());
   if (req.method==='POST' && url.pathname==='/api/requests') { requireRole(user,['Business Requester','Administrator']); return send(res,201,createRequest(await readBody(req),user)); }
   const statusMatch=url.pathname.match(/^\/api\/requests\/([^/]+)\/status$/);
@@ -181,4 +232,5 @@ const server = http.createServer(async (req,res) => {
   catch(error) { console.error(error); if(!res.headersSent) send(res,error.status||500,{error:error.status?error.message:'Unexpected server error'}); }
 });
 if (require.main===module) server.listen(PORT,()=>console.log(`Credit insurance request application running at http://localhost:${PORT}`));
-module.exports={server,db,getBootstrap};
+if (require.main===module) setInterval(processPendingReminders,60*60*1000).unref();
+module.exports={server,db,getBootstrap,processPendingReminders};

@@ -52,6 +52,8 @@ test('creates and persists a request', async () => {
   assert.match(created.id,/^CI-\d{4}-\d{3}$/);
   const state = await (await fetch(`${base}/api/bootstrap`)).json();
   assert.ok(state.requests.some(item=>item.id===created.id));
+  const notifications = await (await fetch(`${base}/api/notifications`)).json();
+  assert.ok(notifications.some(item=>item.requestId===created.id && item.type==='new_request'));
 });
 
 test('updates status and records history', async () => {
@@ -62,6 +64,11 @@ test('updates status and records history', async () => {
   assert.equal(response.status,200);
   assert.equal(changed.status,'Approved');
   assert.match(changed.history[0],/Status changed to Approved/);
+  const notifications = await (await fetch(`${base}/api/notifications`)).json();
+  const stageNotice = notifications.find(item=>item.requestId===id && item.type==='status_change');
+  assert.ok(stageNotice);
+  const marked = await fetch(`${base}/api/notifications/${stageNotice.id}/read`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:'{}'});
+  assert.equal(marked.status,200);
 });
 
 test('rejects invalid requests and workflow statuses', async () => {

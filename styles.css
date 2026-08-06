@@ -48,7 +48,18 @@ h1, h2, h3 { font-family: "Segoe UI", Arial, sans-serif; }
 h1 { margin: 6px 0 0; font-size: clamp(25px, 3vw, 34px); letter-spacing: -1.2px; }
 .top-actions { display: flex; gap: 10px; align-items: center; }
 .icon-button { position: relative; width: 40px; height: 40px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: white; }
-.notification-dot { position: absolute; top: 8px; right: 9px; width: 6px; height: 6px; border: 2px solid white; border-radius: 50%; background: var(--orange); }
+.notification-badge { position: absolute; top: -6px; right: -6px; min-width: 18px; padding: 2px 5px; border: 2px solid #f7f9f8; border-radius: 12px; color: white; background: var(--red); font-size: 9px; font-weight: 700; }
+.notification-list { display: grid; gap: 0; }
+.notification-item { display: flex; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.notification-item:last-child { border-bottom: 0; }
+.notification-item.unread { background: #f8fbfa; }
+.notification-type { width: 9px; height: 9px; margin-top: 5px; flex: 0 0 auto; border-radius: 50%; background: var(--teal); }
+.notification-item.reminder .notification-type { background: var(--orange); }
+.notification-copy { flex: 1; }
+.notification-copy strong { display: block; font-size: 11px; }
+.notification-copy p { margin: 4px 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.notification-copy time { color: #929d9b; font-size: 9px; }
+.mark-read { border: 0; color: var(--teal); background: transparent; font-size: 9px; }
 .primary-button, .secondary-button, .ghost-button, .danger-button { padding: 10px 15px; border-radius: 9px; font-weight: 600; transition: .2s; }
 .primary-button { border: 1px solid var(--teal); color: white; background: var(--teal); box-shadow: 0 5px 15px rgba(11,116,108,.18); }
 .primary-button:hover { background: #08665f; transform: translateY(-1px); }
