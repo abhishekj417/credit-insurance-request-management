@@ -52,10 +52,11 @@ function mapRequest(row:any) {
     docs:documents.reduce((flags:boolean[],doc:any)=>{flags[doc.checklist_index]=true;return flags;},[]),
     documentFiles:documents.map((doc:any)=>({id:doc.id,checklistIndex:doc.checklist_index,label:doc.label,filename:doc.filename,size:doc.size_bytes})),
     history:history.map((item:any)=>({event:item.event,actor:item.actor_name,createdAt:item.created_at})),
-    comments:comments.map((item:any)=>({id:item.id,author:item.author_name,body:item.body,createdAt:item.created_at}))
+    comments:comments.map((item:any)=>({id:item.id,author:item.author_name,body:item.body,createdAt:item.created_at})),
+    claims:(row.assignment_claims??[]).map((item:any)=>({id:item.id,reviewerId:item.reviewer_id,reviewerName:item.reviewer_name,status:item.status,decisionNote:item.decision_note,createdAt:item.created_at,decidedAt:item.decided_at}))
   };
 }
-const requestSelect="*,request_documents(id,checklist_index,label,filename,size_bytes),request_history(event,actor_name,created_at),request_comments(id,author_name,body,created_at)";
+const requestSelect="*,request_documents(id,checklist_index,label,filename,size_bytes),request_history(event,actor_name,created_at),request_comments(id,author_name,body,created_at),assignment_claims(id,reviewer_id,reviewer_name,status,decision_note,created_at,decided_at)";
 async function requestById(supabase:SupabaseClient,id:string) { const {data,error}=await supabase.from("credit_requests").select(requestSelect).eq("id",id).single(); if(error) throw error; return mapRequest(data); }
 
 async function bootstrap(request:Request) {
@@ -101,8 +102,9 @@ async function updateRequest(request:Request,code:string) {
   const payload=await request.json() as Record<string,unknown>; const config=await settings(supabase); const statuses=Array.isArray(config.statuses)?config.statuses:[];
   const status=value(payload.status,120); const statusConfig=statuses.find((item:any)=>item.name===status); if(!statusConfig) fail("Unknown workflow status");
   const {data:before,error:findError}=await supabase.from("credit_requests").select("id,request_code,buyer,status,requester_id,owner_id,owner_name,coface_reference,approved_amount,approval_valid_until,coface_conditions,decision_reason").eq("request_code",code).single(); if(findError) throw findError;
+  if(profile.app_role==="Finance Reviewer"&&before.owner_id!==user.id) fail("Only the assigned reviewer or an Administrator can update this request",403);
   let ownerId: string|null = typeof payload.ownerId==="string"&&payload.ownerId?payload.ownerId:null; let ownerName="Finance Review Queue";
-  if(profile.app_role==="Finance Reviewer") { ownerId=user.id; ownerName=profile.full_name||profile.email; }
+  if(profile.app_role==="Finance Reviewer") { ownerId=before.owner_id; ownerName=before.owner_name; }
   else if(ownerId) { const {data:owner,error:ownerError}=await supabase.from("profiles").select("id,email,full_name,app_role,approved").eq("id",ownerId).single(); if(ownerError||!owner||!owner.approved||!["Finance Reviewer","Administrator"].includes(owner.app_role)) fail("Select an active finance reviewer or administrator as owner"); ownerName=owner.full_name||owner.email; }
   const nextAction=value(payload.nextAction,500)||(["Approved","Rejected","Closed"].includes(status)?"No further action":"Review and progress request");
   const cofaceReference=value(payload.cofaceReference,120)||before.coface_reference||"-";
@@ -120,6 +122,28 @@ async function updateRequest(request:Request,code:string) {
   await supabase.from("request_history").insert({request_id:before.id,event:changes,actor_id:user.id,actor_name:profile.full_name||profile.email});
   await supabase.from("audit_events").insert({actor_id:user.id,actor_email:profile.email,action:"request.workflow_updated",entity_type:"credit_request",entity_id:code,details:{from:before.status,to:status,owner_id:ownerId,next_action:nextAction}});
   return response(await requestById(supabase,before.id));
+}
+
+async function claimRequest(request:Request,code:string) {
+  const {supabase,user,profile}=await context(request); requireRole(profile,["Finance Reviewer"]);
+  const {data:item,error:findError}=await supabase.from("credit_requests").select("id,request_code,buyer,owner_id").eq("request_code",code).single(); if(findError) throw findError;
+  if(item.owner_id===user.id) return response(await requestById(supabase,item.id));
+  if(item.owner_id) fail("This request is already assigned to another reviewer",409);
+  const {data:existing}=await supabase.from("assignment_claims").select("id").eq("request_id",item.id).eq("reviewer_id",user.id).eq("status","Pending").maybeSingle();
+  if(!existing) { const {error}=await supabase.from("assignment_claims").insert({request_id:item.id,reviewer_id:user.id,reviewer_name:profile.full_name||profile.email}); if(error) throw error; }
+  await supabase.from("request_history").insert({request_id:item.id,event:"Assignment requested from Administrator",actor_id:user.id,actor_name:profile.full_name||profile.email});
+  await supabase.from("audit_events").insert({actor_id:user.id,actor_email:profile.email,action:"request.assignment_requested",entity_type:"credit_request",entity_id:code,details:{reviewer_id:user.id}});
+  return response(await requestById(supabase,item.id),202);
+}
+
+async function decideClaim(request:Request,id:string) {
+  const {supabase,user,profile}=await context(request); requireRole(profile,["Administrator"]); const payload=await request.json() as {decision?:unknown;note?:unknown};
+  const decision=value(payload.decision,20); const note=value(payload.note,1000); if(!["Approved","Rejected"].includes(decision)) fail("Decision must be Approved or Rejected"); if(decision==="Rejected"&&!note) fail("A rejection reason is required");
+  const {data:claim,error:findError}=await supabase.from("assignment_claims").select("id,request_id,reviewer_name,status").eq("id",id).single(); if(findError) throw findError; if(claim.status!=="Pending") fail("This assignment request has already been decided",409);
+  const {error}=await supabase.from("assignment_claims").update({status:decision,decision_note:note,decided_by:user.id,decided_by_name:profile.full_name||profile.email,decided_at:new Date().toISOString()}).eq("id",id); if(error) fail(error.message.includes("already assigned")?"This request is already assigned to another reviewer":"The assignment decision could not be saved",409);
+  await supabase.from("request_history").insert({request_id:claim.request_id,event:"Assignment request "+decision.toLowerCase()+" for "+claim.reviewer_name,actor_id:user.id,actor_name:profile.full_name||profile.email});
+  await supabase.from("audit_events").insert({actor_id:user.id,actor_email:profile.email,action:"request.assignment_"+decision.toLowerCase(),entity_type:"assignment_claim",entity_id:id,details:{request_id:claim.request_id,reviewer_name:claim.reviewer_name,note}});
+  return response(await requestById(supabase,claim.request_id));
 }
 
 async function addComment(request:Request,code:string) {
@@ -171,6 +195,8 @@ async function route(request:Request,routeContext:{params:Promise<{path:string[]
     if(request.method==="GET"&&joined==="notifications") return notifications(request);
     if(request.method==="PATCH"&&path[0]==="notifications"&&path[2]==="read") return markRead(request,path[1]);
     if(request.method==="PATCH"&&path[0]==="requests"&&path[2]==="workflow") return updateRequest(request,decodeURIComponent(path[1]));
+    if(request.method==="POST"&&path[0]==="requests"&&path[2]==="claim") return claimRequest(request,decodeURIComponent(path[1]));
+    if(request.method==="PATCH"&&path[0]==="claims"&&path[1]) return decideClaim(request,path[1]);
     if(request.method==="POST"&&path[0]==="requests"&&path[2]==="comments") return addComment(request,decodeURIComponent(path[1]));
     if(request.method==="PATCH"&&path[0]==="admin"&&path[1]==="users"&&path[2]) return updateUserAccess(request,path[2]);
     if(request.method==="PUT"&&path[0]==="config"&&["statuses","documents","reminders"].includes(path[1])) return updateConfig(request,path[1]);
