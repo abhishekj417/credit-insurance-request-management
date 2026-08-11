@@ -59,8 +59,7 @@ async function createRequest(request:Request) {
   const due=new Date(); due.setUTCDate(due.getUTCDate()+1);
   const {data:created,error:createError}=await supabase.from("credit_requests").insert({requester_id:user.id,requester_name:profile.full_name||profile.email,buyer,country,business_unit:unit,amount,currency,payment_terms:terms,status:firstStatus,due_date:due.toISOString().slice(0,10),note}).select("*").single();
   if(createError) throw createError;
-  const requestCode=`CI-${new Date().getUTCFullYear()}-${String(created.request_number).padStart(6,"0")}`;
-  const {error:codeError}=await supabase.from("credit_requests").update({request_code:requestCode}).eq("id",created.id); if(codeError) throw codeError;
+  const requestCode=created.request_code as string;
   const uploaded:string[]=[];
   try {
     for(let index=0;index<files.length;index++) { const file=files[index]; if(!file) continue; const path=`${created.id}/${crypto.randomUUID()}.pdf`; const {error:uploadError}=await supabase.storage.from(BUCKET).upload(path,file,{contentType:"application/pdf",upsert:false}); if(uploadError) throw uploadError; uploaded.push(path); const {error:docError}=await supabase.from("request_documents").insert({request_id:created.id,checklist_index:index,label:checklist[index].name,storage_path:path,filename:cleanFilename(file.name),content_type:"application/pdf",size_bytes:file.size,uploaded_by:user.id}); if(docError) throw docError; }
