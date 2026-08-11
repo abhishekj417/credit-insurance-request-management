@@ -93,9 +93,9 @@ async function markRead(request:Request,id:string) { const {supabase}=await cont
 async function updateConfig(request:Request,section:string) { const {supabase,profile}=await context(request); requireRole(profile,["Administrator"]); const value=await request.json(); if(!Array.isArray(value)) throw Object.assign(new Error("Configuration must be an array"),{status:400}); const {error}=await supabase.from("app_settings").update({value_json:value,updated_at:new Date().toISOString()}).eq("section",section); if(error) throw error; return response(value); }
 async function documentUrl(request:Request,id:string) { const {supabase}=await context(request); const {data:document,error}=await supabase.from("request_documents").select("storage_path").eq("id",id).single(); if(error) throw error; const {data,error:signError}=await supabase.storage.from(BUCKET).createSignedUrl(document.storage_path,120); if(signError) throw signError; return response({url:data.signedUrl,expiresIn:120}); }
 
-async function route(request:Request,params:Promise<{path:string[]}>) {
+async function route(request:Request,routeContext:{params:Promise<{path:string[]}>|{path:string[]}}) {
   try {
-    const path=(await params).path??[]; const joined=path.join("/");
+    const path=(await routeContext.params).path??[]; const joined=path.join("/");
     if(request.method==="GET"&&joined==="health") return response({status:"ok",database:"Supabase configured"});
     if(request.method==="GET"&&joined==="session") { const {profile}=await context(request); return response({name:profile.full_name||profile.email,email:profile.email,roles:[profile.app_role]}); }
     if(request.method==="GET"&&joined==="bootstrap") return bootstrap(request);
