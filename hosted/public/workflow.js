@@ -1,155 +1,106 @@
-const DEFAULTS = {
-  statuses: [
-    { name: "Submitted to Finance", color: "blue", sla: 1 },
-    { name: "Documents Under Review", color: "orange", sla: 2 },
-    { name: "Returned—Documents Required", color: "red", sla: 3 },
-    { name: "Ready for COFACE Submission", color: "teal", sla: 1 },
-    { name: "Submitted to COFACE", color: "blue", sla: 5 },
-    { name: "Additional Information Required", color: "orange", sla: 3 },
-    { name: "Approved", color: "teal", sla: 0 },
-    { name: "Rejected", color: "red", sla: 0 },
-    { name: "Closed", color: "gray", sla: 0 }
-  ],
-  documents: [
-    { name: "Trade / commercial licence", required: true },
-    { name: "VAT certificate", required: true },
-    { name: "Buyer financial information", required: false }
-  ],
-  roles: [
-    { name: "Business requester", access: "Create & view own" },
-    { name: "Head of Distribution", access: "View business unit" },
-    { name: "Credit Insurance POC", access: "Review & manage" },
-    { name: "Finance stakeholder", access: "View all" },
-    { name: "Administrator", access: "Full access" }
-  ],
-  reminders: [
-    { event: "New request not reviewed", after: 1, recipient: "Credit Insurance POC" },
-    { event: "Documents still outstanding", after: 2, recipient: "Business requester" },
-    { event: "COFACE response overdue", after: 5, recipient: "Credit Insurance POC" },
-    { event: "Approval nearing expiry", after: 30, recipient: "Business requester" }
-  ],
-  requests: []
-};
+const DEFAULTS={statuses:[],documents:[],reminders:[],requests:[],users:[],audit:[],ownerOptions:[],session:{}};
+let state=structuredClone(DEFAULTS),activeView="dashboard",adminTab="users",notifications=[];
+const terminal=["Approved","Rejected","Closed"];
+const esc=value=>String(value??"").replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+const attr=esc;
 
-const clone = value => JSON.parse(JSON.stringify(value));
-let state = clone(DEFAULTS);
-let activeView = "dashboard";
-let adminTab = "statuses";
-let notifications = [];
+async function api(path,options={}){
+  const headers={...(options.headers||{})}; if(!(options.body instanceof FormData)) headers["Content-Type"]="application/json";
+  if(window.CREDIT_ACCESS_TOKEN) headers.Authorization=`Bearer ${window.CREDIT_ACCESS_TOKEN}`;
+  const response=await fetch(path,{...options,headers}); const payload=await response.json().catch(()=>({}));
+  if(!response.ok) throw new Error(payload.error||`Request failed (${response.status})`); return payload;
+}
+function money(value,currency="AED"){return new Intl.NumberFormat("en-AE",{style:"currency",currency,maximumFractionDigits:0}).format(Number(value)||0);}
+function dateLabel(value){if(!value)return "Not recorded";return new Date(`${value}T12:00:00`).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"});}
+function dateTime(value){if(!value)return "";return new Date(value).toLocaleString("en-GB",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"});}
+function statusColor(status){return state.statuses.find(item=>item.name===status)?.color||"gray";}
+function isOverdue(item){return item.due&&new Date(`${item.due}T23:59:00`)<new Date()&&!terminal.includes(item.status);}
+function toast(message,type="info"){const root=document.querySelector("#toastRoot");if(!root)return;const node=document.createElement("div");node.className=`toast ${type}`;node.textContent=message;root.append(node);setTimeout(()=>node.remove(),3500);}
+function isAdmin(){return state.session?.isAdmin===true;}
+function canReview(){return state.session?.canReview===true;}
+function currentUserOwns(item){return item.ownerId&&item.ownerId===state.session?.id;}
 
-async function api(path, options={}) {
-  const headers={...(options.headers||{})};
-  if (!(options.body instanceof FormData)) headers['Content-Type']='application/json';
-  if (window.CREDIT_ACCESS_TOKEN) headers.Authorization=`Bearer ${window.CREDIT_ACCESS_TOKEN}`;
-  const response = await fetch(path, { ...options, headers });
-  const payload = await response.json().catch(()=>({}));
-  if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
-  return payload;
+function render(){
+  const adminNav=document.querySelector("#adminNav"); if(adminNav) adminNav.hidden=!isAdmin();
+  const role=document.querySelector("#sessionRole"); if(role) role.textContent=state.session?.role||"";
+  const count=document.querySelector("#requestCount"); if(count) count.textContent=state.requests.filter(item=>!terminal.includes(item.status)).length;
+  renderDashboard();renderRequests();if(isAdmin())renderAdmin();
 }
-function money(value, currency="AED") { return new Intl.NumberFormat("en-AE", { style:"currency", currency, maximumFractionDigits:0 }).format(value); }
-function dateLabel(value) { return new Date(value + "T12:00:00").toLocaleDateString("en-GB", { day:"2-digit", month:"short", year:"numeric" }); }
-function statusColor(status) { return state.statuses.find(s => s.name === status)?.color || "gray"; }
-function isOverdue(request) { return new Date(request.due + "T23:59:00") < new Date() && !["Approved","Rejected","Closed"].includes(request.status); }
-function toast(message) { const el=document.createElement("div"); el.className="toast"; el.textContent=message; document.querySelector("#toastRoot").append(el); setTimeout(()=>el.remove(),2600); }
-function renderNotificationBadge(){ const count=notifications.filter(n=>!n.readAt).length; const badge=document.querySelector('#notificationBadge'); badge.textContent=count; badge.hidden=count===0; }
-async function loadNotifications(){ try { notifications=await api('/api/notifications'); renderNotificationBadge(); } catch {} }
+function metric(label,value,note,tone=""){return `<div class="metric-card ${tone}"><div class="metric-label">${esc(label)}</div><div class="metric-value">${esc(value)}</div><div class="metric-note">${note}</div></div>`;}
+function renderDashboard(){
+  const open=state.requests.filter(item=>!terminal.includes(item.status)); const overdue=open.filter(isOverdue);
+  const mine=open.filter(item=>currentUserOwns(item)); const waiting=open.filter(item=>item.status.includes("COFACE"));
+  const priority=[...open].sort((a,b)=>Number(isOverdue(b))-Number(isOverdue(a))||String(a.due).localeCompare(String(b.due))).slice(0,7);
+  document.querySelector("#dashboardView").innerHTML=`<div class="metrics">${metric("Open requests",open.length,"Active workflow items")}${metric("My actions",mine.length,"Assigned directly to you")}${metric("Overdue",overdue.length,overdue.length?"Action is past its SLA":"No overdue actions",overdue.length?"metric-alert":"")}${metric("Awaiting COFACE",waiting.length,"External response pending")}</div><div class="dashboard-grid"><section class="panel"><div class="panel-header"><div><h2>Priority work queue</h2><p>Overdue and upcoming actions, ordered by urgency</p></div><button class="ghost-button" data-go="requests">View all</button></div>${requestTable(priority)}</section><section class="panel"><div class="panel-header"><div><h2>Control summary</h2><p>Your access and current workload</p></div></div><div class="control-summary"><div><span>Signed-in role</span><strong>${esc(state.session.role)}</strong></div><div><span>Requests visible</span><strong>${state.requests.length}</strong></div><div><span>Next action owner</span><strong>${mine.length} assigned</strong></div><div><span>Administration</span><strong>${isAdmin()?"Enabled":"Restricted"}</strong></div></div></section></div>`;
+}
+function requestTable(items){
+  if(!items.length)return `<div class="empty-state"><strong>No requests found</strong><span>Create a request or adjust the filters.</span></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Request and buyer</th><th>Status</th><th>Requested limit</th><th>Action owner</th><th>Next action</th><th>Due</th></tr></thead><tbody>${items.map(item=>`<tr class="clickable" data-request="${attr(item.id)}"><td class="company-cell"><strong>${esc(item.buyer)}</strong><small>${esc(item.id)} | ${esc(item.unit)}</small></td><td><span class="status status-${attr(statusColor(item.status))}">${esc(item.status)}</span></td><td>${esc(money(item.amount,item.currency))}</td><td>${esc(item.owner||"Finance Review Queue")}</td><td class="next-action-cell">${esc(item.nextAction||"Not recorded")}</td><td class="${isOverdue(item)?"due-over":""}">${esc(dateLabel(item.due))}${isOverdue(item)?"<small>Overdue</small>":""}</td></tr>`).join("")}</tbody></table></div>`;
+}
+function renderRequests(){
+  document.querySelector("#requestsView").innerHTML=`<div class="section-toolbar"><div class="search"><input id="requestSearch" aria-label="Search requests" placeholder="Search request, buyer, owner or business unit"></div><select id="statusFilter" class="filter-select" aria-label="Filter by status"><option value="">All statuses</option>${state.statuses.map(item=>`<option>${esc(item.name)}</option>`).join("")}</select><select id="attentionFilter" class="filter-select" aria-label="Filter by attention"><option value="">All requests</option><option value="mine">Assigned to me</option><option value="overdue">Overdue</option></select></div><div class="panel" id="requestTablePanel">${requestTable(state.requests)}</div>`;
+}
+function renderAdmin(){
+  if(!isAdmin())return; const tabs=[["users","Users and access"],["statuses","Workflow and SLA"],["documents","Document checklist"],["reminders","Reminders"],["audit","Audit log"]];
+  document.querySelector("#adminView").innerHTML=`<div class="admin-layout"><div class="panel admin-tabs">${tabs.map(([key,label])=>`<button class="admin-tab ${adminTab===key?"active":""}" data-admin-tab="${key}">${label}</button>`).join("")}</div><div class="panel admin-content" id="adminContent">${adminPanel()}</div></div>`;
+}
+function roleOptions(selected){return ["Business Requester","Finance Reviewer","Administrator"].map(role=>`<option ${role===selected?"selected":""}>${role}</option>`).join("");}
+function adminPanel(){
+  if(adminTab==="users")return `<div class="admin-heading"><div><h2>Users and access</h2><p>Assign fixed roles and suspend access. Every change is recorded.</p></div><span class="control-badge">Backend enforced</span></div><div class="role-guide"><div><strong>Business Requester</strong><span>Create and view own requests</span></div><div><strong>Finance Reviewer</strong><span>Review, claim and progress requests</span></div><div><strong>Administrator</strong><span>Manage access, settings and all requests</span></div></div><div class="table-wrap"><table><thead><tr><th>User</th><th>Role</th><th>Account</th><th>Created</th><th></th></tr></thead><tbody>${state.users.map(user=>`<tr><td class="company-cell"><strong>${esc(user.fullName||"Name not provided")}</strong><small>${esc(user.email)}</small></td><td><select class="compact-select" data-user-role="${attr(user.id)}">${roleOptions(user.role)}</select></td><td><label class="switch-label"><input type="checkbox" data-user-approved="${attr(user.id)}" ${user.approved?"checked":""}> ${user.approved?"Active":"Suspended"}</label></td><td>${esc(dateLabel(String(user.createdAt).slice(0,10)))}</td><td><button class="secondary-button" data-save-user="${attr(user.id)}">Save access</button></td></tr>`).join("")}</tbody></table></div>`;
+  if(adminTab==="audit")return `<h2>Audit log</h2><p>Recent security, configuration and workflow events.</p><div class="audit-list">${state.audit.length?state.audit.map(item=>`<div class="audit-item"><div><strong>${esc(item.action.replaceAll("."," "))}</strong><span>${esc(item.actor)} | ${esc(item.entityType)} ${esc(item.entityId)}</span></div><time>${esc(dateTime(item.createdAt))}</time></div>`).join(""):`<div class="empty-state">No audit events recorded.</div>`}</div>`;
+  if(adminTab==="statuses")return `<h2>Workflow and SLA</h2><p>Configure stages and business-day action deadlines.</p><div class="config-list">${state.statuses.map((item,index)=>`<div class="config-row"><input type="text" value="${attr(item.name)}" data-field="name" data-index="${index}"><select data-field="color" data-index="${index}">${["teal","blue","orange","red","gray"].map(color=>`<option ${color===item.color?"selected":""}>${color}</option>`).join("")}</select><label>SLA <input type="number" min="0" max="90" value="${Number(item.sla)||0}" data-field="sla" data-index="${index}"> business days</label><button class="delete-row" aria-label="Delete status" data-delete="statuses" data-index="${index}">Remove</button></div>`).join("")}</div><button class="secondary-button add-row" data-add="statuses">Add status</button>${saveBar()}`;
+  if(adminTab==="documents")return `<h2>Document checklist</h2><p>Control the PDF documents required before submission.</p><div class="config-list">${state.documents.map((item,index)=>`<div class="config-row"><input type="text" value="${attr(item.name)}" data-field="name" data-index="${index}"><label><input type="checkbox" ${item.required?"checked":""} data-field="required" data-index="${index}"> Required</label><button class="delete-row" data-delete="documents" data-index="${index}">Remove</button></div>`).join("")}</div><button class="secondary-button add-row" data-add="documents">Add document</button>${saveBar()}`;
+  return `<h2>Reminders and escalation</h2><p>Overdue alerts are generated every day at 05:00 UTC.</p><div class="config-list">${state.reminders.map((item,index)=>`<div class="config-row"><input type="text" value="${attr(item.event)}" data-field="event" data-index="${index}"><label>After <input type="number" min="1" max="365" value="${Number(item.after)||1}" data-field="after" data-index="${index}"> days</label><select data-field="recipient" data-index="${index}">${["Business Requester","Finance Reviewer","Administrator"].map(role=>`<option ${role===item.recipient?"selected":""}>${role}</option>`).join("")}</select><button class="delete-row" data-delete="reminders" data-index="${index}">Remove</button></div>`).join("")}</div><button class="secondary-button add-row" data-add="reminders">Add reminder</button>${saveBar()}`;
+}
+function saveBar(){return `<div class="save-bar"><button class="primary-button" id="saveConfig">Save configuration</button></div>`;}
 
-function render() {
-  document.querySelector("#requestCount").textContent = state.requests.filter(r => !["Closed","Approved","Rejected"].includes(r.status)).length;
-  renderDashboard(); renderRequests(); renderAdmin();
+function showNewRequest(){
+  const documents=state.documents.map((item,index)=>`<div class="form-group ${index>1?"full":""}"><label>${esc(item.name)}${item.required?' <span class="required">*</span>':""}</label><div class="upload-box">PDF only, maximum 10 MB<input type="file" accept="application/pdf,.pdf" data-doc="${index}" ${item.required?"required":""}></div></div>`).join("");
+  modal(`<div class="modal"><form id="newRequestForm"><div class="modal-head"><div><h2>New credit insurance request</h2><p>Provide complete buyer information for finance review</p></div><button type="button" class="close-modal" aria-label="Close">Close</button></div><div class="modal-body"><div class="form-grid"><div class="form-group full"><label>Buyer legal name <span class="required">*</span></label><input name="buyer" required maxlength="200"></div><div class="form-group"><label>Country <span class="required">*</span></label><input name="country" required maxlength="100"></div><div class="form-group"><label>Business unit <span class="required">*</span></label><input name="unit" required maxlength="120"></div><div class="form-group"><label>Requested credit limit <span class="required">*</span></label><input name="amount" type="number" min="1" step="0.01" required></div><div class="form-group"><label>Currency</label><select name="currency"><option>AED</option><option>USD</option><option>EUR</option><option>SAR</option></select></div><div class="form-group"><label>Payment terms</label><input name="terms" maxlength="200"></div><div class="form-group"><label>Requester</label><input value="${attr(state.session.name||state.session.email)}" disabled></div><div class="form-group full"><label>Business justification</label><textarea name="note" maxlength="2000"></textarea></div>${documents}</div></div><div class="modal-foot"><button type="button" class="secondary-button close-modal">Cancel</button><button type="submit" class="primary-button">Submit request</button></div></form></div>`);
 }
+function documentItem(document,item,index){const file=(item.documentFiles||[]).find(entry=>Number(entry.checklistIndex)===index);return `<div class="document-item"><span>${esc(document.name)}</span>${file?`<button class="document-state document-link" data-document-id="${attr(file.id)}">Open PDF</button>`:`<span class="missing-state">Missing</span>`}</div>`;}
+function ownerOptions(item){const options=[{id:"",name:"Finance Review Queue"},...state.ownerOptions];return options.map(owner=>`<option value="${attr(owner.id)}" ${String(owner.id)===String(item.ownerId||"")?"selected":""}>${esc(owner.name)}</option>`).join("");}
+function showRequest(id){
+  const item=state.requests.find(entry=>entry.id===id);if(!item)return;
+  const workflow=canReview()?`<form id="workflowForm" data-request-code="${attr(item.id)}"><div class="detail-section"><h3>Workflow action</h3><label class="field-label">Stage<select name="status">${state.statuses.map(status=>`<option ${status.name===item.status?"selected":""}>${esc(status.name)}</option>`).join("")}</select></label><label class="field-label">Action owner<select name="ownerId">${ownerOptions(item)}</select></label><label class="field-label">Next required action<textarea name="nextAction" maxlength="500" required>${esc(item.nextAction)}</textarea></label></div><div class="detail-section"><h3>COFACE outcome</h3><label class="field-label">COFACE reference<input name="cofaceReference" maxlength="120" value="${attr(item.coface==="-"?"":item.coface)}"></label><label class="field-label">Approved amount<input name="approvedAmount" type="number" min="0" step="0.01" value="${item.approved??""}"></label><label class="field-label">Approval valid until<input name="approvalValidUntil" type="date" value="${attr(item.approvalValidUntil||"")}"></label><label class="field-label">Conditions<textarea name="conditions" maxlength="2000">${esc(item.conditions)}</textarea></label><label class="field-label">Decision or rejection reason<textarea name="decisionReason" maxlength="2000">${esc(item.decisionReason)}</textarea></label><button class="primary-button full-button" type="submit">Save workflow update</button></div></form>`:"";
+  const comments=(item.comments||[]).map(comment=>`<div class="comment"><div><strong>${esc(comment.author)}</strong><time>${esc(dateTime(comment.createdAt))}</time></div><p>${esc(comment.body)}</p></div>`).join("")||`<div class="empty-inline">No comments yet.</div>`;
+  const history=(item.history||[]).map(entry=>`<div class="timeline-item"><strong>${esc(entry.event)}</strong><span>${esc(entry.actor)} | ${esc(dateTime(entry.createdAt))}</span></div>`).join("");
+  modal(`<div class="modal wide"><div class="modal-head"><div><span class="eyebrow">${esc(item.id)}</span><h2>${esc(item.buyer)}</h2><p>${esc(item.country)} | ${esc(item.unit)}</p></div><button class="close-modal" aria-label="Close">Close</button></div><div class="modal-body"><div class="detail-summary"><div class="detail-stat"><small>Current status</small><strong><span class="status status-${attr(statusColor(item.status))}">${esc(item.status)}</span></strong></div><div class="detail-stat"><small>Requested limit</small><strong>${esc(money(item.amount,item.currency))}</strong></div><div class="detail-stat"><small>Action owner</small><strong>${esc(item.owner)}</strong></div><div class="detail-stat ${isOverdue(item)?"danger-stat":""}"><small>Action due</small><strong>${esc(dateLabel(item.due))}</strong></div></div><div class="detail-grid"><div><div class="detail-section"><h3>Request details</h3><div class="info-grid"><div class="info-item"><small>Submitted by</small><strong>${esc(item.requester)}</strong></div><div class="info-item"><small>Submitted on</small><strong>${esc(dateLabel(item.submitted))}</strong></div><div class="info-item"><small>Payment terms</small><strong>${esc(item.terms)}</strong></div><div class="info-item"><small>Next action</small><strong>${esc(item.nextAction)}</strong></div><div class="info-item"><small>COFACE reference</small><strong>${esc(item.coface)}</strong></div><div class="info-item"><small>Approval validity</small><strong>${esc(dateLabel(item.approvalValidUntil))}</strong></div></div></div><div class="detail-section"><h3>Business justification</h3><p class="long-copy">${esc(item.note||"Not provided")}</p></div><div class="detail-section"><h3>Documents</h3>${state.documents.map((document,index)=>documentItem(document,item,index)).join("")}</div><div class="detail-section"><h3>Comments</h3><div class="comments">${comments}</div><form id="commentForm" data-request-code="${attr(item.id)}"><textarea name="body" maxlength="2000" required placeholder="Add a factual workflow comment"></textarea><button class="secondary-button" type="submit">Add comment</button></form></div><div class="detail-section"><h3>Activity history</h3><div class="timeline">${history}</div></div></div><aside>${workflow}</aside></div></div></div>`);
+}
+function modal(html){document.querySelector("#modalRoot").innerHTML=`<div class="modal-backdrop">${html}</div>`;}
+function closeModal(){document.querySelector("#modalRoot").innerHTML="";}
+function renderNotificationBadge(){const badge=document.querySelector("#notificationBadge");const count=notifications.filter(item=>!item.readAt).length;if(badge){badge.textContent=count;badge.hidden=count===0;}}
+async function loadNotifications(){try{notifications=await api("/api/notifications");renderNotificationBadge();}catch{}}
+function showNotifications(){modal(`<div class="modal"><div class="modal-head"><div><h2>Notifications</h2><p>Assignments, status changes and overdue actions</p></div><button class="close-modal">Close</button></div><div class="modal-body"><div class="notification-list">${notifications.length?notifications.map(item=>`<div class="notification-item ${item.type==="reminder"?"reminder":""} ${item.readAt?"":"unread"}"><span class="notification-type"></span><div class="notification-copy"><strong>${esc(item.title)}</strong><p>${esc(item.message)}</p><time>${esc(dateTime(item.createdAt))}</time></div>${item.readAt?"":`<button class="mark-read" data-read-notification="${attr(item.id)}">Mark read</button>`}</div>`).join(""):`<div class="empty-state">No notifications.</div>`}</div></div></div>`);}
 
-function renderDashboard() {
-  const open=state.requests.filter(r=>!["Approved","Rejected","Closed"].includes(r.status));
-  const overdue=open.filter(isOverdue);
-  const missing=open.filter(r=>r.status.includes("Documents Required"));
-  const waiting=open.filter(r=>r.status.includes("COFACE") || r.status.includes("Information"));
-  document.querySelector("#dashboardView").innerHTML = `
-    <div class="metrics">
-      ${metric("Open requests",open.length,"↗",`${open.length} active across the business`)}
-      ${metric("Needs attention",overdue.length,"!",`<strong>${overdue.length} overdue</strong> action${overdue.length===1?"":"s"}`)}
-      ${metric("Awaiting COFACE",waiting.length,"⌛","External response pending")}
-      ${metric("Documents missing",missing.length,"▱","Waiting on business")}
-    </div>
-    <div class="dashboard-grid">
-      <div class="panel">
-        <div class="panel-header"><div><h2>Priority requests</h2><p>Items needing your attention or approaching their due date</p></div><button class="ghost-button" data-go="requests">View all →</button></div>
-        ${requestTable([...state.requests].sort((a,b)=>isOverdue(b)-isOverdue(a)).slice(0,5))}
-      </div>
-      <div class="panel">
-        <div class="panel-header"><div><h2>Recent activity</h2><p>Latest request updates</p></div></div>
-        <div class="action-list">
-          ${state.requests.slice(0,4).map((r,i)=>`<div class="action-item"><span class="action-symbol">${i===0?"✓":"↗"}</span><div><strong>${r.history[0]}</strong><p>${r.buyer} · ${r.id}</p><time>${i+1}h ago</time></div></div>`).join("")}
-        </div>
-      </div>
-    </div>`;
-}
-function metric(label,value,icon,note) { return `<div class="metric-card"><div class="metric-label">${label}<span class="metric-icon">${icon}</span></div><div class="metric-value">${value}</div><div class="metric-note">${note}</div></div>`; }
-function requestTable(requests) {
-  if (!requests.length) return `<div class="empty-state">No requests match this view.</div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>Request / Buyer</th><th>Status</th><th>Requested limit</th><th>Owner</th><th>Due date</th></tr></thead><tbody>${requests.map(r=>`<tr class="clickable" data-request="${r.id}"><td class="company-cell"><strong>${r.buyer}</strong><small>${r.id} · ${r.unit}</small></td><td><span class="status status-${statusColor(r.status)}">${r.status}</span></td><td>${money(r.amount,r.currency)}</td><td>${r.owner}</td><td class="${isOverdue(r)?"due-over":""}">${dateLabel(r.due)}${isOverdue(r)?" · Overdue":""}</td></tr>`).join("")}</tbody></table></div>`;
-}
-
-function renderRequests() {
-  document.querySelector("#requestsView").innerHTML = `<div class="section-toolbar"><div class="search"><span>⌕</span><input id="requestSearch" placeholder="Search buyer, ID, owner or business unit"></div><select id="statusFilter" class="filter-select"><option value="">All statuses</option>${state.statuses.map(s=>`<option>${s.name}</option>`).join("")}</select></div><div class="panel" id="requestTablePanel">${requestTable(state.requests)}</div>`;
-}
-
-function renderAdmin() {
-  const tabs=[['statuses','Workflow statuses'],['documents','Document checklist'],['roles','Roles & access'],['reminders','Reminders & escalation']];
-  document.querySelector("#adminView").innerHTML=`<div class="admin-layout"><div class="panel admin-tabs">${tabs.map(t=>`<button class="admin-tab ${adminTab===t[0]?"active":""}" data-admin-tab="${t[0]}">${t[1]}</button>`).join("")}</div><div class="panel admin-content" id="adminContent">${adminPanel()}</div></div>`;
-}
-function adminPanel() {
-  if(adminTab==='statuses') return `<h2>Workflow statuses</h2><p>Define the stages, colour and expected turnaround time for every request.</p><div class="config-list">${state.statuses.map((s,i)=>`<div class="config-row"><span class="drag">⋮⋮</span><input type="text" value="${s.name}" data-field="name" data-index="${i}"><select data-field="color" data-index="${i}">${['teal','blue','orange','red','gray'].map(c=>`<option ${c===s.color?'selected':''}>${c}</option>`).join('')}</select><label>SLA <input type="number" min="0" value="${s.sla}" data-field="sla" data-index="${i}" style="width:55px"> days</label><button class="delete-row" data-delete="statuses" data-index="${i}">×</button></div>`).join('')}</div><button class="secondary-button add-row" data-add="statuses">＋ Add status</button>${saveBar()}`;
-  if(adminTab==='documents') return `<h2>Document checklist</h2><p>Choose which documents are mandatory before a request can be submitted.</p><div class="config-list">${state.documents.map((d,i)=>`<div class="config-row"><span class="drag">⋮⋮</span><input type="text" value="${d.name}" data-field="name" data-index="${i}"><label><input type="checkbox" ${d.required?'checked':''} data-field="required" data-index="${i}"> Required</label><button class="delete-row" data-delete="documents" data-index="${i}">×</button></div>`).join('')}</div><button class="secondary-button add-row" data-add="documents">＋ Add document</button>${saveBar()}`;
-  if(adminTab==='roles') return `<h2>Roles & access</h2><p>Configure who can create, review and oversee requests.</p><div class="config-list">${state.roles.map((r,i)=>`<div class="config-row"><input type="text" value="${r.name}" data-field="name" data-index="${i}"><select data-field="access" data-index="${i}">${['Create & view own','View business unit','Review & manage','View all','Full access'].map(a=>`<option ${a===r.access?'selected':''}>${a}</option>`).join('')}</select><button class="delete-row" data-delete="roles" data-index="${i}">×</button></div>`).join('')}</div><button class="secondary-button add-row" data-add="roles">＋ Add role</button>${saveBar()}`;
-  return `<h2>Reminders & escalation</h2><p>Set automatic follow-ups so that no request is forgotten in an inbox.</p><div class="config-list">${state.reminders.map((r,i)=>`<div class="config-row"><input type="text" value="${r.event}" data-field="event" data-index="${i}"><label>After <input type="number" min="1" value="${r.after}" data-field="after" data-index="${i}" style="width:55px"> days</label><select data-field="recipient" data-index="${i}">${state.roles.map(role=>`<option ${role.name===r.recipient?'selected':''}>${role.name}</option>`).join('')}</select><button class="delete-row" data-delete="reminders" data-index="${i}">×</button></div>`).join('')}</div><button class="secondary-button add-row" data-add="reminders">＋ Add reminder</button>${saveBar()}`;
-}
-function saveBar(){ return `<div class="save-bar"><button class="primary-button" id="saveConfig">Save configuration</button></div>`; }
-
-function showNewRequest() {
-  const docFields=state.documents.map((d,i)=>`<div class="form-group ${i>1?'full':''}"><label>${d.name}${d.required?' <span class="required">*</span>':''}</label><div class="upload-box">Choose a PDF file, maximum 10 MB<input type="file" accept="application/pdf,.pdf" data-doc="${i}" ${d.required?'required':''}></div></div>`).join('');
-  modal(`<div class="modal"><form id="newRequestForm"><div class="modal-head"><div><h2>New credit insurance request</h2><p>Submit buyer details for finance review</p></div><button type="button" class="close-modal">×</button></div><div class="modal-body"><div class="form-grid"><div class="form-group full"><label>Buyer legal name <span class="required">*</span></label><input name="buyer" required></div><div class="form-group"><label>Country <span class="required">*</span></label><input name="country" required></div><div class="form-group"><label>Business unit <span class="required">*</span></label><input name="unit" required></div><div class="form-group"><label>Requested credit limit <span class="required">*</span></label><input name="amount" type="number" min="1" required></div><div class="form-group"><label>Currency</label><select name="currency"><option>AED</option><option>USD</option><option>EUR</option><option>SAR</option></select></div><div class="form-group"><label>Payment terms</label><input name="terms"></div><div class="form-group"><label>Requester</label><input value="Provided by corporate sign-in" disabled></div><div class="form-group full"><label>Business justification</label><textarea name="note"></textarea></div>${docFields}</div></div><div class="modal-foot"><button type="button" class="secondary-button close-modal">Cancel</button><button type="submit" class="primary-button">Submit request</button></div></form></div>`);
-}
-function documentItem(d,i,r){ const file=(r.documentFiles||[]).find(item=>item.label===d.name); return `<div class="document-item"><span>${d.name}</span>${file?`<button class="document-state document-link" data-document-id="${file.id}">Open PDF</button>`:`<span class="document-state">Missing</span>`}</div>`; }
-function showRequest(id) {
-  const r=state.requests.find(x=>x.id===id); if(!r)return;
-  modal(`<div class="modal wide"><div class="modal-head"><div><span class="eyebrow">${r.id}</span><h2>${r.buyer}</h2><p>${r.country} · ${r.unit}</p></div><button class="close-modal">×</button></div><div class="modal-body"><div class="detail-summary"><div class="detail-stat"><small>Current status</small><strong><span class="status status-${statusColor(r.status)}">${r.status}</span></strong></div><div class="detail-stat"><small>Requested limit</small><strong>${money(r.amount,r.currency)}</strong></div><div class="detail-stat"><small>Current owner</small><strong>${r.owner}</strong></div></div><div class="detail-grid"><div><div class="detail-section"><h3>Request details</h3><div class="info-grid"><div class="info-item"><small>Submitted by</small><strong>${r.requester}</strong></div><div class="info-item"><small>Submitted on</small><strong>${dateLabel(r.submitted)}</strong></div><div class="info-item"><small>Payment terms</small><strong>${r.terms}</strong></div><div class="info-item"><small>COFACE reference</small><strong>${r.coface}</strong></div></div></div><div class="detail-section"><h3>Business justification</h3><p style="color:var(--muted);font-size:11px;line-height:1.6">${r.note}</p></div><div class="detail-section"><h3>Activity history</h3><div class="timeline">${r.history.map((h,i)=>`<div class="timeline-item"><strong>${h}</strong><span>${i+1} day${i?'s':''} ago</span></div>`).join('')}</div></div></div><aside><div class="detail-section"><h3>Documents</h3>${state.documents.map((d,i)=>documentItem(d,i,r)).join('')}</div><div class="detail-section"><h3>Move request</h3><select id="detailStatus" style="width:100%;padding:10px">${state.statuses.map(s=>`<option ${s.name===r.status?'selected':''}>${s.name}</option>`).join('')}</select><button class="primary-button" data-update-request="${r.id}" style="width:100%;margin-top:9px">Update status</button></div></aside></div></div></div>`);
-}
-function modal(html){ document.querySelector('#modalRoot').innerHTML=`<div class="modal-backdrop">${html}</div>`; }
-function notificationTime(value){ return new Date(value.replace(' ','T')+'Z').toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}); }
-function showNotifications(){
-  modal(`<div class="modal"><div class="modal-head"><div><h2>Notifications</h2><p>Request updates and pending-action reminders</p></div><button class="close-modal">×</button></div><div class="modal-body"><div class="notification-list">${notifications.length?notifications.map(n=>`<div class="notification-item ${n.type==='reminder'?'reminder':''} ${n.readAt?'':'unread'}"><span class="notification-type"></span><div class="notification-copy"><strong>${n.title}</strong><p>${n.message}</p><time>${notificationTime(n.createdAt)}</time></div>${n.readAt?'':`<button class="mark-read" data-read-notification="${n.id}">Mark read</button>`}</div>`).join(''):'<div class="empty-state">No notifications.</div>'}</div></div></div>`);
-}
-function closeModal(){ document.querySelector('#modalRoot').innerHTML=''; }
-
-document.addEventListener('click', async e => {
-  const nav=e.target.closest('[data-view]'); if(nav) switchView(nav.dataset.view);
-  if(e.target.closest('#newRequestButton')) showNewRequest();
-  if(e.target.closest('.close-modal') || e.target.classList.contains('modal-backdrop')) closeModal();
-  const row=e.target.closest('[data-request]'); if(row) showRequest(row.dataset.request);
-  const go=e.target.closest('[data-go]'); if(go) switchView(go.dataset.go);
-  const tab=e.target.closest('[data-admin-tab]'); if(tab){ adminTab=tab.dataset.adminTab; renderAdmin(); }
-  const del=e.target.closest('[data-delete]'); if(del){ state[del.dataset.delete].splice(Number(del.dataset.index),1); renderAdmin(); }
-  const add=e.target.closest('[data-add]'); if(add){ const key=add.dataset.add; const templates={statuses:{name:'New status',color:'gray',sla:1},documents:{name:'New document',required:false},roles:{name:'New role',access:'View all'},reminders:{event:'New reminder',after:1,recipient:state.roles[0]?.name||'Administrator'}}; state[key].push(templates[key]); renderAdmin(); }
-  if(e.target.closest('#saveConfig')){ captureConfig(); try { state[adminTab]=await api(`/api/config/${adminTab}`,{method:'PUT',body:JSON.stringify(state[adminTab])}); render(); toast('Configuration saved'); } catch(error){ toast(error.message); } }
-  const update=e.target.closest('[data-update-request]'); if(update){ try { const changed=await api(`/api/requests/${encodeURIComponent(update.dataset.updateRequest)}/status`,{method:'PATCH',body:JSON.stringify({status:document.querySelector('#detailStatus').value})}); const index=state.requests.findIndex(x=>x.id===changed.id); state.requests[index]=changed; closeModal(); render(); toast('Request status updated'); } catch(error){ toast(error.message); } }
-  if(e.target.closest('#mobileMenu')) document.querySelector('.sidebar').classList.toggle('open');
-  if(e.target.closest('#notificationButton')){ await loadNotifications(); showNotifications(); }
-  const readNotification=e.target.closest('[data-read-notification]'); if(readNotification){ try { await api(`/api/notifications/${readNotification.dataset.readNotification}/read`,{method:'PATCH',body:'{}'}); await loadNotifications(); showNotifications(); } catch(error){ toast(error.message); } }
-  const documentButton=e.target.closest('[data-document-id]'); if(documentButton){ try { const result=await api(`/api/documents/${documentButton.dataset.documentId}`); window.open(result.url,'_blank','noopener,noreferrer'); } catch(error){ toast(error.message); } }
+document.addEventListener("click",async event=>{
+  const nav=event.target.closest("[data-view]");if(nav){switchView(nav.dataset.view);return;}
+  if(event.target.closest("#newRequestButton")){showNewRequest();return;}
+  if(event.target.closest(".close-modal")||event.target.classList.contains("modal-backdrop")){closeModal();return;}
+  const row=event.target.closest("[data-request]");if(row){showRequest(row.dataset.request);return;}
+  const go=event.target.closest("[data-go]");if(go){switchView(go.dataset.go);return;}
+  const tab=event.target.closest("[data-admin-tab]");if(tab&&isAdmin()){adminTab=tab.dataset.adminTab;renderAdmin();return;}
+  const remove=event.target.closest("[data-delete]");if(remove&&isAdmin()){state[remove.dataset.delete].splice(Number(remove.dataset.index),1);renderAdmin();return;}
+  const add=event.target.closest("[data-add]");if(add&&isAdmin()){const key=add.dataset.add;const templates={statuses:{name:"New status",color:"gray",sla:1},documents:{name:"New document",required:false},reminders:{event:"New reminder",after:3,recipient:"Finance Reviewer"}};state[key].push(templates[key]);renderAdmin();return;}
+  if(event.target.closest("#saveConfig")&&isAdmin()){captureConfig();try{state[adminTab]=await api(`/api/config/${adminTab}`,{method:"PUT",body:JSON.stringify(state[adminTab])});toast("Configuration saved");renderAdmin();}catch(error){toast(error.message,"error");}return;}
+  const saveUser=event.target.closest("[data-save-user]");if(saveUser&&isAdmin()){const id=saveUser.dataset.saveUser;const role=document.querySelector(`[data-user-role="${CSS.escape(id)}"]`).value;const approved=document.querySelector(`[data-user-approved="${CSS.escape(id)}"]`).checked;try{await api(`/api/admin/users/${encodeURIComponent(id)}`,{method:"PATCH",body:JSON.stringify({role,approved})});toast("User access updated");await refresh();adminTab="users";renderAdmin();}catch(error){toast(error.message,"error");}return;}
+  if(event.target.closest("#mobileMenu"))document.querySelector(".sidebar").classList.toggle("open");
+  if(event.target.closest("#notificationButton")){await loadNotifications();showNotifications();return;}
+  const read=event.target.closest("[data-read-notification]");if(read){try{await api(`/api/notifications/${read.dataset.readNotification}/read`,{method:"PATCH",body:"{}"});await loadNotifications();showNotifications();}catch(error){toast(error.message,"error");}return;}
+  const documentButton=event.target.closest("[data-document-id]");if(documentButton){try{const result=await api(`/api/documents/${documentButton.dataset.documentId}`);window.open(result.url,"_blank","noopener,noreferrer");}catch(error){toast(error.message,"error");}}
 });
-document.addEventListener('submit', async e => {
-  if(e.target.id!=='newRequestForm')return; e.preventDefault(); const form=new FormData(e.target);
-  state.documents.forEach((_,i)=>{ const file=e.target.querySelector(`[data-doc="${i}"]`)?.files?.[0]; if(file) form.append(`document_${i}`,file,file.name); });
-  try { const created=await api('/api/requests',{method:'POST',body:form}); state.requests.unshift(created); await loadNotifications(); closeModal(); render(); switchView('requests'); toast('Request submitted and notification created'); } catch(error){ toast(error.message); }
+document.addEventListener("submit",async event=>{
+  if(event.target.id==="newRequestForm"){event.preventDefault();const form=new FormData(event.target);state.documents.forEach((_,index)=>{const file=event.target.querySelector(`[data-doc="${index}"]`)?.files?.[0];if(file)form.append(`document_${index}`,file,file.name);});try{const created=await api("/api/requests",{method:"POST",body:form});state.requests.unshift(created);await loadNotifications();closeModal();render();switchView("requests");toast("Request submitted for finance review");}catch(error){toast(error.message,"error");}return;}
+  if(event.target.id==="workflowForm"){event.preventDefault();const form=new FormData(event.target);const payload=Object.fromEntries(form.entries());try{const updated=await api(`/api/requests/${encodeURIComponent(event.target.dataset.requestCode)}/workflow`,{method:"PATCH",body:JSON.stringify(payload)});replaceRequest(updated);closeModal();render();toast("Workflow update saved");}catch(error){toast(error.message,"error");}return;}
+  if(event.target.id==="commentForm"){event.preventDefault();const form=new FormData(event.target);try{const updated=await api(`/api/requests/${encodeURIComponent(event.target.dataset.requestCode)}/comments`,{method:"POST",body:JSON.stringify({body:form.get("body")})});replaceRequest(updated);showRequest(updated.id);render();toast("Comment added");}catch(error){toast(error.message,"error");}}
 });
-document.addEventListener('input',e=>{ if(e.target.id==='requestSearch') filterRequests(); });
-document.addEventListener('change',e=>{ if(e.target.id==='statusFilter') filterRequests(); });
-function filterRequests(){ const q=(document.querySelector('#requestSearch')?.value||'').toLowerCase(); const status=document.querySelector('#statusFilter')?.value||''; const list=state.requests.filter(r=>(!status||r.status===status)&&[r.id,r.buyer,r.owner,r.unit].join(' ').toLowerCase().includes(q)); document.querySelector('#requestTablePanel').innerHTML=requestTable(list); }
-function captureConfig(){ document.querySelectorAll('#adminContent [data-field]').forEach(el=>{ const value=el.type==='checkbox'?el.checked:el.type==='number'?Number(el.value):el.value; state[adminTab][Number(el.dataset.index)][el.dataset.field]=value; }); }
-function switchView(view){ activeView=view; document.querySelectorAll('.view').forEach(v=>v.classList.remove('active')); document.querySelector(`#${view}View`).classList.add('active'); document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.view===view)); const copy={dashboard:['CREDIT INSURANCE','Request overview'],requests:['REQUEST MANAGEMENT','All credit requests'],admin:['APPLICATION CONTROL','Administration']}; document.querySelector('#pageEyebrow').textContent=copy[view][0]; document.querySelector('#pageTitle').textContent=copy[view][1]; document.querySelector('.sidebar').classList.remove('open'); }
-async function init(){
-  try { state=await api('/api/bootstrap'); await loadNotifications(); render(); }
-  catch(error){ render(); toast('Application service unavailable. Contact your administrator.'); }
-}
+document.addEventListener("input",event=>{if(event.target.id==="requestSearch")filterRequests();});
+document.addEventListener("change",event=>{if(["statusFilter","attentionFilter"].includes(event.target.id))filterRequests();if(event.target.matches("[data-user-approved]")){const label=event.target.closest("label");if(label)label.lastChild.textContent=event.target.checked?" Active":" Suspended";}});
+function replaceRequest(updated){const index=state.requests.findIndex(item=>item.id===updated.id);if(index>=0)state.requests[index]=updated;}
+function filterRequests(){const query=(document.querySelector("#requestSearch")?.value||"").toLowerCase();const status=document.querySelector("#statusFilter")?.value||"";const attention=document.querySelector("#attentionFilter")?.value||"";const list=state.requests.filter(item=>(!status||item.status===status)&&(!attention||(attention==="mine"&&currentUserOwns(item))||(attention==="overdue"&&isOverdue(item)))&&[item.id,item.buyer,item.owner,item.unit,item.nextAction].join(" ").toLowerCase().includes(query));document.querySelector("#requestTablePanel").innerHTML=requestTable(list);}
+function captureConfig(){document.querySelectorAll("#adminContent [data-field]").forEach(element=>{const output=element.type==="checkbox"?element.checked:element.type==="number"?Number(element.value):element.value;state[adminTab][Number(element.dataset.index)][element.dataset.field]=output;});}
+function switchView(view){if(view==="admin"&&!isAdmin())return;activeView=view;document.querySelectorAll(".view").forEach(node=>node.classList.remove("active"));document.querySelector(`#${view}View`)?.classList.add("active");document.querySelectorAll(".nav-item").forEach(node=>node.classList.toggle("active",node.dataset.view===view));const copy={dashboard:["CREDIT INSURANCE","Request overview"],requests:["REQUEST MANAGEMENT","Credit requests"],admin:["APPLICATION CONTROL","Administration"]};document.querySelector("#pageEyebrow").textContent=copy[view][0];document.querySelector("#pageTitle").textContent=copy[view][1];document.querySelector(".sidebar").classList.remove("open");}
+async function refresh(){state={...DEFAULTS,...await api("/api/bootstrap")};render();}
+async function init(){try{await refresh();await loadNotifications();}catch(error){toast(error.message||"Application service unavailable","error");}}
+window.CREDIT_WORKFLOW_INIT=init;
 init();
