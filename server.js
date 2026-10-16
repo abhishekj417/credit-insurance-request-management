@@ -221,7 +221,7 @@ async function uploadDocument(req, user, id, docIndexParam) {
   const docName = checklist[docIndex]?.name || 'Document';
   addEvent(id, user.name, 'document', `Uploaded ${originalName} (${docName})`);
   const notice = { eventKey:`document:${id}:${result.lastInsertRowid}`, requestId:id, type:'document', title:'Document uploaded', message:`${id} - ${row.buyer}: ${user.name} uploaded ${docName}.` };
-  if (row.requester === user.name) addNotification({ ...notice, role:'Finance Reviewer' });
+  if (row.requester === user.name) notifyFinance(row, notice);
   else addNotification({ ...notice, user:row.requester });
   return { id:Number(result.lastInsertRowid), docIndex, name:originalName, size:body.length, uploadedBy:user.name };
 }
@@ -241,7 +241,7 @@ function addComment(user, id, input) {
   const preview = text.length > 140 ? `${text.slice(0,137)}...` : text;
   // Requester comments go to Finance (and the assigned reviewer); Finance comments go to the requester.
   if (row.requester === user.name) {
-    addNotification({eventKey,role:'Finance Reviewer',requestId:id,type:'comment',title:`New comment from ${user.name}`,message:`${id} - ${row.buyer}: ${preview}`});
+    notifyFinance(row,{eventKey,requestId:id,type:'comment',title:`New comment from ${user.name}`,message:`${id} - ${row.buyer}: ${preview}`});
   } else {
     addNotification({eventKey,user:row.requester,requestId:id,type:'comment',title:`New comment from ${user.name}`,message:`${id} - ${row.buyer}: ${preview}`});
   }
@@ -352,8 +352,22 @@ function createRequest(input, user) {
 }
 function needsRequesterAction(status) { return status.includes('Documents Required') || status.includes('Information Required'); }
 function notifyFinance(row, notice) {
-  if (row.owner && row.owner !== 'Finance Review Queue') addNotification({ ...notice, user:row.owner });
+  if (row.owner && row.owner !== QUEUE_OWNER) addNotification({ ...notice, user:row.owner });
   else addNotification({ ...notice, role:'Finance Reviewer' });
+}
+const QUEUE_OWNER = 'Finance Review Queue';
+function assignRequest(user, id, input) {
+  const row = accessibleRequest(user, id);
+  const release = input.release === true;
+  if (release) {
+    if (row.owner !== user.name && !user.roles.includes('Administrator')) throw Object.assign(new Error('Only the assigned reviewer or an administrator can release this request'),{status:403});
+    if (row.owner === QUEUE_OWNER) throw Object.assign(new Error('This request is not assigned'),{status:409});
+  } else if (row.owner === user.name) throw Object.assign(new Error('This request is already assigned to you'),{status:409});
+  const owner = release ? QUEUE_OWNER : user.name;
+  db.prepare('UPDATE requests SET owner=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(owner, id);
+  addEvent(id, user.name, 'assignment', release ? `Released ${row.owner === user.name ? 'their assignment' : `from ${row.owner}`} back to the Finance queue` : row.owner === QUEUE_OWNER ? 'Took ownership of the request' : `Took ownership from ${row.owner}`);
+  if (!release) addNotification({ eventKey:`assign:${id}:${Date.now()}`, user:row.requester, requestId:id, type:'assignment', title:'Reviewer assigned', message:`${id} - ${row.buyer} is being handled by ${user.name}.` });
+  return mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));
 }
 function respondToRequest(user, id, input) {
   const row = accessibleRequest(user, id);
@@ -438,6 +452,14 @@ async function api(req,res,url) {
     const uploaded=await uploadDocument(req,user,id,url.searchParams.get('doc'));
     audit(req,user,'document.upload','success',{resourceId:id,details:{documentId:uploaded.id,docIndex:uploaded.docIndex,size:uploaded.size}});
     return send(res,201,uploaded);
+  }
+  const assignMatch=url.pathname.match(/^\/api\/requests\/([^/]+)\/assign$/);
+  if (req.method==='POST' && assignMatch) {
+    requireRole(user,['Finance Reviewer','Administrator']);
+    const id=decodeURIComponent(assignMatch[1]);
+    const changed=assignRequest(user,id,await readBody(req));
+    audit(req,user,'request.assign','success',{resourceId:id,details:{owner:changed.owner}});
+    return send(res,200,changed);
   }
   const respondMatch=url.pathname.match(/^\/api\/requests\/([^/]+)\/respond$/);
   if (req.method==='POST' && respondMatch) {

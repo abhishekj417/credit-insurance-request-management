@@ -215,3 +215,28 @@ test('approval records the COFACE reference and approved limit', async () => {
   assert.match(detail.events[0].message,/COFACE COF-2026-0099, approved AED 20,000/);
   assert.equal((await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Closed', cofaceReference:'x'.repeat(101) })).status,400);
 });
+
+test('finance reviewers take ownership and receive the requester follow-ups', async () => {
+  const otherReviewer = as('Second Reviewer', ['Finance Reviewer']);
+  const created = await newRequest(requesterA,'Assignment Buyer');
+  assert.equal((await post(`/api/requests/${created.id}/assign`, requesterA, {})).status,403);
+  const assigned = await post(`/api/requests/${created.id}/assign`, reviewer, {});
+  assert.equal(assigned.status,200);
+  assert.equal((await assigned.json()).owner,'Finance User');
+  assert.equal((await post(`/api/requests/${created.id}/assign`, reviewer, {})).status,409);
+  const requesterNotices = await (await api('/api/notifications', requesterA)).json();
+  assert.ok(requesterNotices.some(n=>n.requestId===created.id && n.type==='assignment' && /Finance User/.test(n.message)));
+
+  // Follow-ups now go to the assigned reviewer personally, not the whole Finance role.
+  await post(`/api/requests/${created.id}/comments`, requesterA, { text:'Question for my reviewer' });
+  const mine = await (await api('/api/notifications', reviewer)).json();
+  const others = await (await api('/api/notifications', otherReviewer)).json();
+  assert.ok(mine.some(n=>n.requestId===created.id && n.type==='comment'));
+  assert.ok(!others.some(n=>n.requestId===created.id && n.type==='comment'));
+
+  assert.equal((await post(`/api/requests/${created.id}/assign`, otherReviewer, { release:true })).status,403);
+  const released = await post(`/api/requests/${created.id}/assign`, reviewer, { release:true });
+  assert.equal((await released.json()).owner,'Finance Review Queue');
+  const detail = await (await api(`/api/requests/${created.id}`, admin)).json();
+  assert.deepEqual(detail.events.filter(e=>e.type==='assignment').map(e=>e.actor),['Finance User','Finance User']);
+});
