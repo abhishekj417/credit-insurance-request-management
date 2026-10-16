@@ -5,7 +5,10 @@ services:
     ports:
       - "4173:4173"
     environment:
-      AUTH_MODE: development
+      # Requires Microsoft Entra identity headers from App Service Authentication (or an equivalent
+      # authenticating reverse proxy that strips client-supplied x-ms-client-principal* headers).
+      # Never expose this port directly to users. AUTH_MODE=development is refused when NODE_ENV=production.
+      AUTH_MODE: entra
       FRAME_ANCESTORS: "'self'"
     volumes:
       - credit-insurance-data:/app/data

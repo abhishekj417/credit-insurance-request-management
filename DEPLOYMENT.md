@@ -11,7 +11,7 @@ Requirements: Windows computer or server with Node.js 22.5 or later.
 3. Open `http://localhost:4173`.
 4. Back up the `data` directory regularly.
 
-This mode is suitable only for a limited pilot on an approved device. It does not provide corporate single sign-on.
+This mode is suitable only for a limited pilot on an approved device. `start-local.ps1` sets `AUTH_MODE=development`, which disables sign-in and grants every role, so never use it on a shared server. The server refuses to start in development mode when `NODE_ENV=production`.
 
 ### Container deployment
 
@@ -36,13 +36,21 @@ For corporate use, place the service behind HTTPS and a company reverse proxy. D
 
 ## Identity and permissions
 
-In development mode, the local user receives all roles so that the complete workflow can be tested. In Entra mode, the API requires identity headers supplied by Azure App Service Authentication and enforces application roles:
+`AUTH_MODE` defaults to `entra`. In development mode, the local user receives all roles so that the complete workflow can be tested. In Entra mode, the API requires identity headers supplied by Azure App Service Authentication and enforces application roles:
 
 - `Business Requester`: create requests
 - `Finance Reviewer`: update workflow status
 - `Administrator`: update status and configuration
 
 The server, not the browser, records the authenticated requester identity.
+
+## Security controls
+
+- Only `index.html`, `styles.css` and `app.js` are served as static files; all other paths return 404.
+- Per-user rate limits (default 300 reads and 30 writes per minute, configurable with `RATE_LIMIT_READS` / `RATE_LIMIT_WRITES`) return HTTP 429 when exceeded. Reminder scans run at most once every five minutes.
+- Authentication failures, authorization denials, rate-limit blocks and every write (request creation, status change, configuration change, notification read) are written as JSON lines to stdout and to the `audit_events` table. Forward container stdout to the central log store / SIEM.
+- API responses send `X-Content-Type-Options: nosniff`, a restrictive Content-Security-Policy, and HSTS on HTTPS requests. Configure HSTS at the TLS-terminating proxy as well.
+- The browser escapes all server-supplied values before rendering them.
 
 ## Production readiness checklist
 

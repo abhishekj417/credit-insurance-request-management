@@ -168,7 +168,17 @@ async function notifications(request:Request) {
   const {data,error}=await supabase.from("notifications").select("id,request_id,notification_type,title,message,read_at,created_at").order("created_at",{ascending:false}).limit(75); if(error) throw error;
   return response((data??[]).map((item:any)=>({id:item.id,requestId:item.request_id,type:item.notification_type,title:item.title,message:item.message,readAt:item.read_at,createdAt:item.created_at})));
 }
-async function markRead(request:Request,id:string) { const {supabase}=await context(request); const {error}=await supabase.from("notifications").update({read_at:new Date().toISOString()}).eq("id",id); if(error) throw error; return response({ok:true}); }
+async function markRead(request:Request,id:string) {
+  const {supabase,user}=await context(request);
+  // Defence in depth: check ownership here as well as in the notifications_update RLS policy.
+  const {data:notification,error:lookupError}=await supabase.from("notifications").select("id,recipient_id").eq("id",id).maybeSingle();
+  if(lookupError) throw lookupError;
+  if(!notification) fail("Notification not found",404);
+  if(notification.recipient_id!==user.id) fail("You do not have permission to update this notification",403);
+  const {error}=await supabase.from("notifications").update({read_at:new Date().toISOString()}).eq("id",id).eq("recipient_id",user.id);
+  if(error) throw error;
+  return response({ok:true});
+}
 async function updateConfig(request:Request,section:string) {
   const {supabase,user,profile}=await context(request); requireRole(profile,["Administrator"]); const data=await request.json();
   if(!Array.isArray(data)||data.length<1||data.length>50) fail("Configuration must contain between 1 and 50 items");

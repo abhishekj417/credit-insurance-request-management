@@ -7,8 +7,16 @@ const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
 const DB_PATH = process.env.CREDITFLOW_DB || path.join(DATA_DIR, 'creditflow.db');
 const PORT = Number(process.env.PORT || 4173);
-const AUTH_MODE = process.env.AUTH_MODE || 'development';
+const AUTH_MODE = process.env.AUTH_MODE || 'entra';
 const FRAME_ANCESTORS = process.env.FRAME_ANCESTORS || "'self'";
+const STATIC_FILES = new Set(['/index.html','/styles.css','/app.js']);
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMITS = { read: Number(process.env.RATE_LIMIT_READS || 300), write: Number(process.env.RATE_LIMIT_WRITES || 30) };
+const REMINDER_SCAN_INTERVAL_MS = 5 * 60 * 1000;
+
+// Refuse to boot in an unauthenticated configuration outside local development.
+if (!['entra','development'].includes(AUTH_MODE)) throw new Error(`Unsupported AUTH_MODE "${AUTH_MODE}". Use "entra" (or "development" for local pilots only).`);
+if (AUTH_MODE === 'development' && process.env.NODE_ENV === 'production') throw new Error('AUTH_MODE=development disables authentication and is not allowed when NODE_ENV=production.');
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new DatabaseSync(DB_PATH);
@@ -58,6 +66,18 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(recipient_user, read_at);
   CREATE INDEX IF NOT EXISTS idx_notifications_role ON notifications(recipient_role, read_at);
+  CREATE TABLE IF NOT EXISTS audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    actor TEXT,
+    roles TEXT,
+    action TEXT NOT NULL,
+    resource_id TEXT,
+    outcome TEXT NOT NULL,
+    ip TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}'
+  );
+  CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at);
 `);
 
 const seed = {
@@ -102,10 +122,14 @@ function mapRequest(row) {
     due:row.due_date, submitted:row.submitted_date, coface:row.coface_reference, approved:row.approved_amount,
     note:row.note, docs:parseJson(row.documents_json), history:parseJson(row.history_json) };
 }
-function getBootstrap() {
+function canViewAllRequests(user) { return ['Finance Reviewer','Administrator'].some(role=>user.roles.includes(role)); }
+function getBootstrap(user) {
   const output = {};
   for (const row of db.prepare('SELECT section, value_json FROM settings').all()) output[row.section] = parseJson(row.value_json);
-  output.requests = db.prepare('SELECT * FROM requests ORDER BY submitted_date DESC, id DESC').all().map(mapRequest);
+  // Business Requesters only see their own submissions; reviewers and administrators see everything.
+  output.requests = (canViewAllRequests(user)
+    ? db.prepare('SELECT * FROM requests ORDER BY submitted_date DESC, id DESC').all()
+    : db.prepare('SELECT * FROM requests WHERE requester=? ORDER BY submitted_date DESC, id DESC').all(user.name)).map(mapRequest);
   return output;
 }
 function addNotification({eventKey=null,user=null,role=null,requestId=null,type,title,message}) {
@@ -130,11 +154,44 @@ function processPendingReminders() {
   }
   return pending.length;
 }
+let lastReminderScan = 0;
+function maybeProcessPendingReminders(now=Date.now()) {
+  if (now - lastReminderScan < REMINDER_SCAN_INTERVAL_MS) return null;
+  lastReminderScan = now;
+  return processPendingReminders();
+}
+function securityHeaders(req) {
+  const headers = { 'X-Content-Type-Options':'nosniff', 'Referrer-Policy':'same-origin' };
+  // TLS is terminated upstream (App Service / reverse proxy); only advertise HSTS on HTTPS requests.
+  if (req && (req.socket?.encrypted || req.headers['x-forwarded-proto'] === 'https')) headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
+  return headers;
+}
 function send(res, status, payload, headers={}) {
   const body = payload === null ? '' : JSON.stringify(payload);
-  res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store', ...headers });
+  res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store',
+    'Content-Security-Policy':"default-src 'none'; frame-ancestors 'none'", ...securityHeaders(res.req), ...headers });
   res.end(body);
 }
+function clientIp(req) { return req.socket?.remoteAddress || null; }
+function audit(req, user, action, outcome, { resourceId=null, details={} }={}) {
+  const event = { timestamp:new Date().toISOString(), type:'audit', actor:user?.name || null, roles:user?.roles || [], action,
+    resourceId, outcome, ip:clientIp(req), method:req.method, path:req.url, details };
+  console.log(JSON.stringify(event));
+  try {
+    db.prepare('INSERT INTO audit_events (actor,roles,action,resource_id,outcome,ip,details_json) VALUES (?,?,?,?,?,?,?)')
+      .run(event.actor, JSON.stringify(event.roles), action, resourceId, outcome, event.ip, JSON.stringify(details));
+  } catch (error) { console.error(JSON.stringify({ timestamp:event.timestamp, type:'audit_write_failed', message:error.message })); }
+}
+const rateBuckets = new Map();
+function checkRateLimit(key, kind, now=Date.now()) {
+  const bucketKey = `${kind}:${key}`;
+  let bucket = rateBuckets.get(bucketKey);
+  if (!bucket || now - bucket.start >= RATE_LIMIT_WINDOW_MS) { bucket = { start:now, count:0 }; rateBuckets.set(bucketKey, bucket); }
+  bucket.count++;
+  if (bucket.count > RATE_LIMITS[kind]) throw Object.assign(new Error('Too many requests. Please wait a minute and try again.'),
+    { status:429, retryAfter:Math.ceil((bucket.start + RATE_LIMIT_WINDOW_MS - now) / 1000) });
+}
+setInterval(() => { const now=Date.now(); for (const [key,bucket] of rateBuckets) if (now - bucket.start >= RATE_LIMIT_WINDOW_MS) rateBuckets.delete(key); }, RATE_LIMIT_WINDOW_MS).unref();
 function getUser(req) {
   if (AUTH_MODE === 'development') return { name:'Authenticated Employee', roles:['Administrator','Finance Reviewer','Business Requester'] };
   const principal = req.headers['x-ms-client-principal'];
@@ -194,43 +251,65 @@ function updateStatus(id, status) {
 async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{status:'ok',database:'connected'});
   const user=getUser(req);
+  req.user=user;
+  const isWrite=!['GET','HEAD'].includes(req.method);
+  checkRateLimit(user.name, isWrite ? 'write' : 'read');
   if (req.method==='GET' && url.pathname==='/api/session') return send(res,200,user);
-  if (req.method==='GET' && url.pathname==='/api/notifications') { processPendingReminders(); return send(res,200,getNotifications(user)); }
+  if (req.method==='GET' && url.pathname==='/api/notifications') { maybeProcessPendingReminders(); return send(res,200,getNotifications(user)); }
   const notificationMatch=url.pathname.match(/^\/api\/notifications\/(\d+)\/read$/);
   if (req.method==='PATCH' && notificationMatch) {
     const notification=db.prepare('SELECT recipient_user,recipient_role FROM notifications WHERE id=?').get(Number(notificationMatch[1]));
     if (!notification) throw Object.assign(new Error('Notification not found'),{status:404});
     if (notification.recipient_user!==user.name && !user.roles.includes(notification.recipient_role)) throw Object.assign(new Error('You do not have permission to update this notification'),{status:403});
     db.prepare('UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE id=?').run(Number(notificationMatch[1]));
+    audit(req,user,'notification.mark_read','success',{resourceId:notificationMatch[1]});
     return send(res,200,{ok:true});
   }
-  if (req.method==='GET' && url.pathname==='/api/bootstrap') return send(res,200,getBootstrap());
-  if (req.method==='POST' && url.pathname==='/api/requests') { requireRole(user,['Business Requester','Administrator']); return send(res,201,createRequest(await readBody(req),user)); }
+  if (req.method==='GET' && url.pathname==='/api/bootstrap') return send(res,200,getBootstrap(user));
+  if (req.method==='POST' && url.pathname==='/api/requests') {
+    requireRole(user,['Business Requester','Administrator']);
+    const created=createRequest(await readBody(req),user);
+    audit(req,user,'request.create','success',{resourceId:created.id,details:{amount:created.amount,currency:created.currency}});
+    return send(res,201,created);
+  }
   const statusMatch=url.pathname.match(/^\/api\/requests\/([^/]+)\/status$/);
-  if (req.method==='PATCH' && statusMatch) { requireRole(user,['Finance Reviewer','Administrator']); return send(res,200,updateStatus(decodeURIComponent(statusMatch[1]),(await readBody(req)).status)); }
+  if (req.method==='PATCH' && statusMatch) {
+    requireRole(user,['Finance Reviewer','Administrator']);
+    const id=decodeURIComponent(statusMatch[1]);
+    const changed=updateStatus(id,(await readBody(req)).status);
+    audit(req,user,'request.status_change','success',{resourceId:id,details:{status:changed.status}});
+    return send(res,200,changed);
+  }
   const configMatch=url.pathname.match(/^\/api\/config\/(statuses|documents|roles|reminders)$/);
   if (req.method==='PUT' && configMatch) {
     requireRole(user,['Administrator']);
     const value=await readBody(req); if(!Array.isArray(value)) throw Object.assign(new Error('Configuration must be an array'),{status:400});
     db.prepare("UPDATE settings SET value_json=?, updated_at=CURRENT_TIMESTAMP WHERE section=?").run(JSON.stringify(value),configMatch[1]);
+    audit(req,user,'config.update','success',{resourceId:configMatch[1],details:{items:value.length}});
     return send(res,200,value);
   }
   return send(res,404,{error:'API route not found'});
 }
 function serveStatic(req,res,url) {
+  // Only the browser bundle is public; server source, config and tests are never served.
   const pathname = url.pathname==='/' ? '/index.html' : url.pathname;
-  const filePath = path.resolve(ROOT, '.' + decodeURIComponent(pathname));
-  if (!filePath.startsWith(ROOT + path.sep)) return send(res,403,{error:'Forbidden'});
-  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return send(res,404,{error:'File not found'});
-  const type={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml'}[path.extname(filePath)] || 'application/octet-stream';
-  res.writeHead(200,{'Content-Type':type,'X-Content-Type-Options':'nosniff','Referrer-Policy':'same-origin','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':`default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors ${FRAME_ANCESTORS}`});
+  if (!STATIC_FILES.has(pathname)) return send(res,404,{error:'File not found'});
+  const filePath = path.join(ROOT, pathname);
+  const type={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8'}[path.extname(filePath)];
+  res.writeHead(200,{'Content-Type':type,...securityHeaders(req),'Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':`default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors ${FRAME_ANCESTORS}`});
   fs.createReadStream(filePath).pipe(res);
 }
 const server = http.createServer(async (req,res) => {
   const url=new URL(req.url,`http://${req.headers.host||'localhost'}`);
   try { if(url.pathname.startsWith('/api/')) await api(req,res,url); else serveStatic(req,res,url); }
-  catch(error) { console.error(error); if(!res.headersSent) send(res,error.status||500,{error:error.status?error.message:'Unexpected server error'}); }
+  catch(error) {
+    if (error.status===401) audit(req,null,'authentication','failure',{details:{reason:error.message}});
+    else if (error.status===403) audit(req,req.user,'authorization','denied',{details:{reason:error.message}});
+    else if (error.status===429) audit(req,req.user,'rate_limit','blocked');
+    else if (!error.status) console.error(JSON.stringify({timestamp:new Date().toISOString(),type:'error',method:req.method,path:req.url,message:error.message,stack:error.stack}));
+    if(!res.headersSent) send(res,error.status||500,{error:error.status?error.message:'Unexpected server error'},error.retryAfter?{'Retry-After':String(error.retryAfter)}:{});
+  }
 });
-if (require.main===module) server.listen(PORT,()=>console.log(`Credit insurance request application running at http://localhost:${PORT}`));
+if (require.main===module) server.listen(PORT,()=>console.log(JSON.stringify({timestamp:new Date().toISOString(),type:'startup',authMode:AUTH_MODE,port:PORT})));
 if (require.main===module) setInterval(processPendingReminders,60*60*1000).unref();
-module.exports={server,db,getBootstrap,processPendingReminders};
+module.exports={server,db,getBootstrap,processPendingReminders,maybeProcessPendingReminders,checkRateLimit};
