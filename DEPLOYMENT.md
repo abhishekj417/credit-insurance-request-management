@@ -9,7 +9,7 @@ Requirements: Windows computer or server with Node.js 22.5 or later.
 1. Copy this folder to the approved computer.
 2. Run `start-local.ps1`.
 3. Open `http://localhost:4173`.
-4. Back up the `data` directory regularly.
+4. Back up the `data` directory regularly. It holds both the database and uploaded documents.
 
 This mode is suitable only for a limited pilot on an approved device. `start-local.ps1` sets `AUTH_MODE=development`, which disables sign-in and grants every role, so never use it on a shared server. The server refuses to start in development mode when `NODE_ENV=production`.
 
@@ -20,7 +20,7 @@ Requirements: Docker Desktop or an approved container host.
 1. Place the container behind Azure App Service Authentication or an authenticating reverse proxy that injects Microsoft Entra identity headers (`x-ms-client-principal`, `x-ms-client-principal-name`) and strips any client-supplied copies of them.
 2. Run `docker compose up -d --build`. The compose file runs with `AUTH_MODE=entra`; requests without identity headers receive HTTP 401.
 3. Open the application through the authenticating proxy, not directly on port 4173.
-4. Back up the named `credit-insurance-data` volume.
+4. Back up the named `credit-insurance-data` volume. It holds both the database and uploaded documents (`documents/`).
 
 For corporate use, place the service behind HTTPS and a company reverse proxy. Do not expose port 4173 directly to the public internet.
 
@@ -52,6 +52,7 @@ The server, not the browser, records the authenticated requester identity.
 - Authentication failures, authorization denials, rate-limit blocks and every write (request creation, status change, configuration change, notification read) are written as JSON lines to stdout and to the `audit_events` table. Forward container stdout to the central log store / SIEM.
 - API responses send `X-Content-Type-Options: nosniff`, a restrictive Content-Security-Policy, and HSTS on HTTPS requests. Configure HSTS at the TLS-terminating proxy as well.
 - The browser escapes all server-supplied values before rendering them.
+- Uploaded documents are PDF-only (content type and file signature checked), at most 10 MB, stored under random names outside the web root, and only downloadable as attachments by people who can see the request.
 
 ## Production readiness checklist
 

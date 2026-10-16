@@ -20,14 +20,14 @@ These changes move Finance ↔ business communication on credit insurance reques
 
 | Commit | Purpose | New / changed endpoints |
 |---|---|---|
-| `08fc3dc` | Conversation thread on each request; activity timeline records who did what and when | `GET /api/requests/:id`, `POST /api/requests/:id/comments` |
-| `10783a1` | Documents are actually uploaded and stored (previously only a "file chosen" flag) | `POST /api/requests/:id/documents?doc=N`, `GET /api/documents/:id` |
-| `a2eb11e` | Requester answers a "Documents/Information Required" request and sends it back | `POST /api/requests/:id/respond` |
-| `cb14fac` | COFACE reference and approved limit captured; required to approve | `PATCH /api/requests/:id/status` (two optional fields added) |
-| `125efc8` | Finance reviewer can take ownership; follow-ups go to that person | `POST /api/requests/:id/assign` |
-| `d31b4c1` | Due dates follow each stage's SLA (working days); overdue reminders | none |
-| `20a4c87` | Admin configuration validated; CSV export of the register | `PUT /api/config/:section` (validation only), `GET /api/requests/export.csv` |
-| `4a374ff` | Inline styles moved to the stylesheet (they were blocked by the CSP) | none |
+| `d0831e4` | Conversation thread on each request; activity timeline records who did what and when | `GET /api/requests/:id`, `POST /api/requests/:id/comments` |
+| `fa047b3` | Documents are actually uploaded and stored (previously only a "file chosen" flag) | `POST /api/requests/:id/documents?doc=N`, `GET /api/documents/:id` |
+| `ce1d4b2` | Requester answers a "Documents/Information Required" request and sends it back | `POST /api/requests/:id/respond` |
+| `b2619ee` | COFACE reference and approved limit captured; required to approve | `PATCH /api/requests/:id/status` (two optional fields added) |
+| `677bb9e` | Finance reviewer can take ownership; follow-ups go to that person | `POST /api/requests/:id/assign` |
+| `f944085` | Due dates follow each stage's SLA (working days); overdue reminders | none |
+| `bc54c54` | Admin configuration validated; CSV export of the register | `PUT /api/config/:section` (validation only), `GET /api/requests/export.csv` |
+| `14903f3` | Inline styles moved to the stylesheet (they were blocked by the CSP) | none |
 
 ## Access rules for the new endpoints
 
