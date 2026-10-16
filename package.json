@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js && node --check app.js",
-    "test": "node --test tests/api.test.js tests/security.test.js"
+    "test": "node --test tests/api.test.js tests/security.test.js tests/collaboration.test.js"
   },
   "engines": {
     "node": ">=22.5"

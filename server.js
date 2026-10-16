@@ -78,6 +78,16 @@ db.exec(`
     details_json TEXT NOT NULL DEFAULT '{}'
   );
   CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at);
+  CREATE TABLE IF NOT EXISTS request_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    actor TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_request_events_request ON request_events(request_id, created_at);
 `);
 
 const seed = {
@@ -130,7 +140,46 @@ function getBootstrap(user) {
   output.requests = (canViewAllRequests(user)
     ? db.prepare('SELECT * FROM requests ORDER BY submitted_date DESC, id DESC').all()
     : db.prepare('SELECT * FROM requests WHERE requester=? ORDER BY submitted_date DESC, id DESC').all(user.name)).map(mapRequest);
+  output.recentActivity = (canViewAllRequests(user)
+    ? db.prepare(`SELECT e.id,e.request_id AS requestId,r.buyer,e.created_at AS createdAt,e.actor,e.event_type AS type,e.message
+        FROM request_events e JOIN requests r ON r.id=e.request_id ORDER BY e.id DESC LIMIT 8`).all()
+    : db.prepare(`SELECT e.id,e.request_id AS requestId,r.buyer,e.created_at AS createdAt,e.actor,e.event_type AS type,e.message
+        FROM request_events e JOIN requests r ON r.id=e.request_id WHERE r.requester=? ORDER BY e.id DESC LIMIT 8`).all(user.name));
   return output;
+}
+function notFound() { return Object.assign(new Error('Request not found'),{status:404}); }
+// Returns the request row only if the caller may see it. Hidden requests look identical to missing ones.
+function accessibleRequest(user, id) {
+  const row = db.prepare('SELECT * FROM requests WHERE id=?').get(id);
+  if (!row || (!canViewAllRequests(user) && row.requester !== user.name)) throw notFound();
+  return row;
+}
+function addEvent(requestId, actor, type, message) {
+  db.prepare('INSERT INTO request_events (request_id,actor,event_type,message) VALUES (?,?,?,?)').run(requestId, actor, type, message);
+}
+function getEvents(requestId) {
+  return db.prepare(`SELECT id,created_at AS createdAt,actor,event_type AS type,message FROM request_events
+    WHERE request_id=? ORDER BY id DESC`).all(requestId);
+}
+function getRequestDetail(user, id) {
+  const request = mapRequest(accessibleRequest(user, id));
+  return { ...request, events:getEvents(id) };
+}
+function addComment(user, id, input) {
+  const row = accessibleRequest(user, id);
+  if (!validText(input.text, 2000)) throw Object.assign(new Error('Comment must be between 1 and 2000 characters'),{status:400});
+  const text = input.text.trim();
+  addEvent(id, user.name, 'comment', text);
+  db.prepare('UPDATE requests SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(id);
+  const eventKey = `comment:${id}:${Date.now()}`;
+  const preview = text.length > 140 ? `${text.slice(0,137)}...` : text;
+  // Requester comments go to Finance (and the assigned reviewer); Finance comments go to the requester.
+  if (row.requester === user.name) {
+    addNotification({eventKey,role:'Finance Reviewer',requestId:id,type:'comment',title:`New comment from ${user.name}`,message:`${id} - ${row.buyer}: ${preview}`});
+  } else {
+    addNotification({eventKey,user:row.requester,requestId:id,type:'comment',title:`New comment from ${user.name}`,message:`${id} - ${row.buyer}: ${preview}`});
+  }
+  return getEvents(id);
 }
 function addNotification({eventKey=null,user=null,role=null,requestId=null,type,title,message}) {
   db.prepare(`INSERT OR IGNORE INTO notifications
@@ -231,16 +280,18 @@ function createRequest(input, user) {
     history:[`Request submitted by ${user.name}`] };
   db.prepare(`INSERT INTO requests (id,buyer,country,business_unit,amount,currency,payment_terms,status,owner,requester,due_date,submitted_date,coface_reference,approved_amount,note,documents_json,history_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(request.id,request.buyer,request.country,request.unit,request.amount,request.currency,request.terms,request.status,request.owner,request.requester,request.due,request.submitted,request.coface,request.approved,request.note,JSON.stringify(request.docs),JSON.stringify(request.history));
+  addEvent(request.id, user.name, 'created', 'Request submitted for finance review');
   addNotification({eventKey:`created:${request.id}`,role:'Finance Reviewer',requestId:request.id,type:'new_request',title:'New credit insurance request',message:`${request.id} - ${request.buyer} has been submitted for finance review.`});
   return request;
 }
-function updateStatus(id, status) {
+function updateStatus(id, status, user) {
   const allowed = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='statuses'").get().value_json).map(s=>s.name);
   if (!allowed.includes(status)) throw Object.assign(new Error('Unknown workflow status'),{status:400});
   const row = db.prepare('SELECT * FROM requests WHERE id=?').get(id);
   if (!row) throw Object.assign(new Error('Request not found'),{status:404});
   const history = parseJson(row.history_json); history.unshift(`Status changed to ${status}`);
   db.prepare("UPDATE requests SET status=?, history_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status,JSON.stringify(history),id);
+  addEvent(id, user.name, 'status', `Status changed from ${row.status} to ${status}`);
   const changed=mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));
   const eventTime=Date.now();
   addNotification({eventKey:`status:${id}:${eventTime}`,user:changed.requester,requestId:id,type:'status_change',title:'Request stage updated',message:`${id} - ${changed.buyer} moved from ${row.status} to ${status}.`});
@@ -266,6 +317,15 @@ async function api(req,res,url) {
     return send(res,200,{ok:true});
   }
   if (req.method==='GET' && url.pathname==='/api/bootstrap') return send(res,200,getBootstrap(user));
+  const detailMatch=url.pathname.match(/^\/api\/requests\/([^/]+)$/);
+  if (req.method==='GET' && detailMatch) return send(res,200,getRequestDetail(user,decodeURIComponent(detailMatch[1])));
+  const commentMatch=url.pathname.match(/^\/api\/requests\/([^/]+)\/comments$/);
+  if (req.method==='POST' && commentMatch) {
+    const id=decodeURIComponent(commentMatch[1]);
+    const events=addComment(user,id,await readBody(req));
+    audit(req,user,'request.comment','success',{resourceId:id});
+    return send(res,201,events);
+  }
   if (req.method==='POST' && url.pathname==='/api/requests') {
     requireRole(user,['Business Requester','Administrator']);
     const created=createRequest(await readBody(req),user);
@@ -276,7 +336,7 @@ async function api(req,res,url) {
   if (req.method==='PATCH' && statusMatch) {
     requireRole(user,['Finance Reviewer','Administrator']);
     const id=decodeURIComponent(statusMatch[1]);
-    const changed=updateStatus(id,(await readBody(req)).status);
+    const changed=updateStatus(id,(await readBody(req)).status,user);
     audit(req,user,'request.status_change','success',{resourceId:id,details:{status:changed.status}});
     return send(res,200,changed);
   }
