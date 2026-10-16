@@ -17,9 +17,10 @@ This mode is suitable only for a limited pilot on an approved device. `start-loc
 
 Requirements: Docker Desktop or an approved container host.
 
-1. Run `docker compose up -d --build`.
-2. Open `http://server-name:4173`.
-3. Back up the named `credit-insurance-data` volume.
+1. Place the container behind Azure App Service Authentication or an authenticating reverse proxy that injects Microsoft Entra identity headers (`x-ms-client-principal`, `x-ms-client-principal-name`) and strips any client-supplied copies of them.
+2. Run `docker compose up -d --build`. The compose file runs with `AUTH_MODE=entra`; requests without identity headers receive HTTP 401.
+3. Open the application through the authenticating proxy, not directly on port 4173.
+4. Back up the named `credit-insurance-data` volume.
 
 For corporate use, place the service behind HTTPS and a company reverse proxy. Do not expose port 4173 directly to the public internet.
 
