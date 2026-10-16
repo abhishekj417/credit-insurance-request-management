@@ -122,3 +122,6 @@ select, input, textarea { border: 1px solid #dce4e1; border-radius: 8px; outline
 .comment-form { display: grid; gap: 7px; margin-bottom: 14px; }.comment-form textarea { min-height: 58px; padding: 9px; border: 1px solid var(--line); border-radius: 8px; font: inherit; font-size: 10px; resize: vertical; }.comment-form button { justify-self: end; }
 .comment-text { margin: 4px 0 3px; padding: 7px 9px; border-radius: 7px; background: #f4f8f7; font-size: 10px; line-height: 1.5; white-space: pre-wrap; }
 .action-item.clickable { cursor: pointer; }
+.document-block { padding-bottom: 8px; border-bottom: 1px solid var(--line); }.document-block .document-item { border-bottom: 0; }.document-state.missing { color: var(--muted); }
+.document-file { display: block; margin: 2px 0 0; color: var(--teal); font-size: 10px; font-weight: 600; word-break: break-all; }.document-meta { display: block; color: var(--muted); font-size: 9px; }
+.document-upload { display: inline-block; margin-top: 6px; color: var(--teal); font-size: 9px; font-weight: 700; cursor: pointer; }.document-upload input { display: block; margin-top: 4px; font-size: 9px; }

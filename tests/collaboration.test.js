@@ -33,7 +33,7 @@ test.before(async () => {
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'creditflow-collab-'));
   child = spawn(process.execPath, ['server.js'], {
     cwd:projectRoot,
-    env:{ ...process.env, AUTH_MODE:'entra', PORT:String(port), CREDITFLOW_DB:path.join(tempDir,'collab.db') },
+    env:{ ...process.env, AUTH_MODE:'entra', PORT:String(port), CREDITFLOW_DB:path.join(tempDir,'collab.db'), RATE_LIMIT_WRITES:'1000' },
     stdio:['ignore','pipe','pipe']
   });
   for (let i=0;i<50;i++) {
@@ -100,4 +100,62 @@ test('dashboard activity shows real events', async () => {
   const event = state.recentActivity.find(e=>e.requestId===created.id);
   assert.equal(event.actor,'Requester A');
   assert.equal(event.buyer,'Activity Buyer');
+});
+
+const pdf = Buffer.from('%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF');
+const upload = (id, headers, body, { doc=0, type='application/pdf', name='financials.pdf' }={}) =>
+  fetch(`${base}/api/requests/${id}/documents?doc=${doc}`, { method:'POST', headers:{ ...headers, 'Content-Type':type, 'X-File-Name':encodeURIComponent(name) }, body });
+
+test('documents are uploaded, listed and downloadable by people on the request', async () => {
+  const created = await newRequest(requesterA,'Document Buyer');
+  assert.deepEqual(created.docs,[]);
+  const response = await upload(created.id, requesterA, pdf, { doc:1, name:'VAT certificate 2026.pdf' });
+  assert.equal(response.status,201);
+  const uploaded = await response.json();
+  const detail = await (await api(`/api/requests/${created.id}`, reviewer)).json();
+  assert.equal(detail.docs[1],true);
+  assert.deepEqual(detail.documents.map(d=>[d.docIndex,d.name,d.uploadedBy]),[[1,'VAT certificate 2026.pdf','Requester A']]);
+  assert.ok(detail.events.some(e=>e.type==='document' && e.actor==='Requester A'));
+  const financeNotices = await (await api('/api/notifications', reviewer)).json();
+  assert.ok(financeNotices.some(n=>n.requestId===created.id && n.type==='document'));
+  for (const headers of [requesterA, reviewer]) {
+    const download = await fetch(`${base}/api/documents/${uploaded.id}`, { headers });
+    assert.equal(download.status,200);
+    assert.equal(download.headers.get('content-type'),'application/pdf');
+    assert.match(download.headers.get('content-disposition'),/^attachment; filename="VAT certificate 2026.pdf"$/);
+    assert.match(download.headers.get('content-security-policy'),/sandbox/);
+    assert.deepEqual(Buffer.from(await download.arrayBuffer()),pdf);
+  }
+  // Finance can add documents too; the requester is notified.
+  assert.equal((await upload(created.id, reviewer, pdf, { doc:2 })).status,201);
+  const requesterNotices = await (await api('/api/notifications', requesterA)).json();
+  assert.ok(requesterNotices.some(n=>n.requestId===created.id && n.type==='document'));
+});
+
+test('documents are private to the request', async () => {
+  const created = await newRequest(requesterA,'Private Document Buyer');
+  const uploaded = await (await upload(created.id, requesterA, pdf)).json();
+  assert.equal((await fetch(`${base}/api/documents/${uploaded.id}`, { headers:requesterB })).status,404);
+  assert.equal((await fetch(`${base}/api/documents/${uploaded.id}`)).status,401);
+  assert.equal((await upload(created.id, requesterB, pdf)).status,404);
+  assert.equal((await fetch(`${base}/api/documents/999999`, { headers:reviewer })).status,404);
+});
+
+test('rejects unsafe or invalid uploads', async () => {
+  const created = await newRequest();
+  assert.equal((await upload(created.id, requesterA, Buffer.from('MZ executable'), { type:'application/octet-stream' })).status,415);
+  assert.equal((await upload(created.id, requesterA, Buffer.from('<html>not a pdf</html>'))).status,400);
+  assert.equal((await upload(created.id, requesterA, Buffer.alloc(10*1024*1024+1, 0x25))).status,413);
+  assert.equal((await upload(created.id, requesterA, pdf, { doc:99 })).status,400);
+  assert.equal((await upload(created.id, requesterA, pdf, { doc:'abc' })).status,400);
+  const detail = await (await api(`/api/requests/${created.id}`, requesterA)).json();
+  assert.equal(detail.documents.length,0);
+});
+
+test('sanitises uploaded file names', async () => {
+  const created = await newRequest();
+  const uploaded = await (await upload(created.id, requesterA, pdf, { name:'../../etc/"passwd<script>.exe' })).json();
+  assert.doesNotMatch(uploaded.name,/[\/\\"<>]/);
+  assert.ok(uploaded.name.endsWith('.pdf'));
+  assert.ok(!uploaded.name.startsWith('.'));
 });

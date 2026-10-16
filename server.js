@@ -1,6 +1,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 
 const ROOT = __dirname;
@@ -9,6 +10,7 @@ const DB_PATH = process.env.CREDITFLOW_DB || path.join(DATA_DIR, 'creditflow.db'
 const PORT = Number(process.env.PORT || 4173);
 const AUTH_MODE = process.env.AUTH_MODE || 'entra';
 const FRAME_ANCESTORS = process.env.FRAME_ANCESTORS || "'self'";
+const MAX_DOCUMENT_BYTES = 10 * 1024 * 1024;
 const STATIC_FILES = new Set(['/index.html','/styles.css','/app.js']);
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMITS = { read: Number(process.env.RATE_LIMIT_READS || 300), write: Number(process.env.RATE_LIMIT_WRITES || 30) };
@@ -19,6 +21,9 @@ if (!['entra','development'].includes(AUTH_MODE)) throw new Error(`Unsupported A
 if (AUTH_MODE === 'development' && process.env.NODE_ENV === 'production') throw new Error('AUTH_MODE=development disables authentication and is not allowed when NODE_ENV=production.');
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+// Uploaded documents live next to the database (outside the static allowlist) under random file names.
+const DOCS_DIR = path.join(path.dirname(DB_PATH), 'documents');
+fs.mkdirSync(DOCS_DIR, { recursive: true });
 const db = new DatabaseSync(DB_PATH);
 db.exec(`
   PRAGMA journal_mode = WAL;
@@ -88,6 +93,18 @@ db.exec(`
     FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE
   );
   CREATE INDEX IF NOT EXISTS idx_request_events_request ON request_events(request_id, created_at);
+  CREATE TABLE IF NOT EXISTS request_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    doc_index INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    stored_name TEXT NOT NULL UNIQUE,
+    size INTEGER NOT NULL,
+    uploaded_by TEXT NOT NULL,
+    uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_request_documents_request ON request_documents(request_id);
 `);
 
 const seed = {
@@ -161,9 +178,53 @@ function getEvents(requestId) {
   return db.prepare(`SELECT id,created_at AS createdAt,actor,event_type AS type,message FROM request_events
     WHERE request_id=? ORDER BY id DESC`).all(requestId);
 }
+function getDocuments(requestId) {
+  return db.prepare(`SELECT id,doc_index AS docIndex,original_name AS name,size,uploaded_by AS uploadedBy,uploaded_at AS uploadedAt
+    FROM request_documents WHERE request_id=? ORDER BY id`).all(requestId);
+}
 function getRequestDetail(user, id) {
   const request = mapRequest(accessibleRequest(user, id));
-  return { ...request, events:getEvents(id) };
+  return { ...request, events:getEvents(id), documents:getDocuments(id) };
+}
+function cleanFilename(name) {
+  let decoded = '';
+  try { decoded = decodeURIComponent(String(name || '')); } catch { decoded = ''; }
+  const cleaned = decoded.normalize('NFKC').replace(/[^a-zA-Z0-9._ ()-]/g,'_').replace(/^\.+/,'').slice(0,120);
+  return cleaned.toLowerCase().endsWith('.pdf') ? cleaned : `${cleaned || 'document'}.pdf`;
+}
+async function readRaw(req, max) {
+  const chunks=[]; let size=0;
+  for await (const chunk of req) { size += chunk.length; if (size > max) throw Object.assign(new Error('Documents must be 10 MB or smaller'),{status:413}); chunks.push(chunk); }
+  return Buffer.concat(chunks);
+}
+async function uploadDocument(req, user, id, docIndexParam) {
+  const row = accessibleRequest(user, id);
+  const checklist = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='documents'").get().value_json);
+  const docIndex = Number(docIndexParam);
+  if (!Number.isInteger(docIndex) || docIndex < 0 || docIndex >= checklist.length) throw Object.assign(new Error('Unknown document type'),{status:400});
+  if ((req.headers['content-type'] || '').split(';')[0].trim() !== 'application/pdf') throw Object.assign(new Error('Only PDF documents are accepted'),{status:415});
+  const body = await readRaw(req, MAX_DOCUMENT_BYTES);
+  if (body.length < 5 || body.subarray(0,5).toString('latin1') !== '%PDF-') throw Object.assign(new Error('The file is not a valid PDF document'),{status:400});
+  const originalName = cleanFilename(req.headers['x-file-name']);
+  const storedName = `${crypto.randomUUID()}.pdf`;
+  fs.writeFileSync(path.join(DOCS_DIR, storedName), body, { flag:'wx' });
+  const result = db.prepare('INSERT INTO request_documents (request_id,doc_index,original_name,stored_name,size,uploaded_by) VALUES (?,?,?,?,?,?)')
+    .run(id, docIndex, originalName, storedName, body.length, user.name);
+  const docs = parseJson(row.documents_json); docs[docIndex] = true;
+  for (let i=0;i<docs.length;i++) docs[i] = Boolean(docs[i]);
+  db.prepare('UPDATE requests SET documents_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(JSON.stringify(docs), id);
+  const docName = checklist[docIndex]?.name || 'Document';
+  addEvent(id, user.name, 'document', `Uploaded ${originalName} (${docName})`);
+  const notice = { eventKey:`document:${id}:${result.lastInsertRowid}`, requestId:id, type:'document', title:'Document uploaded', message:`${id} - ${row.buyer}: ${user.name} uploaded ${docName}.` };
+  if (row.requester === user.name) addNotification({ ...notice, role:'Finance Reviewer' });
+  else addNotification({ ...notice, user:row.requester });
+  return { id:Number(result.lastInsertRowid), docIndex, name:originalName, size:body.length, uploadedBy:user.name };
+}
+function documentForDownload(user, documentId) {
+  const doc = db.prepare('SELECT * FROM request_documents WHERE id=?').get(documentId);
+  if (!doc) throw Object.assign(new Error('Document not found'),{status:404});
+  try { accessibleRequest(user, doc.request_id); } catch { throw Object.assign(new Error('Document not found'),{status:404}); }
+  return doc;
 }
 function addComment(user, id, input) {
   const row = accessibleRequest(user, id);
@@ -276,7 +337,7 @@ function createRequest(input, user) {
     currency:validText(input.currency,3)?input.currency:'AED', terms:validText(input.terms)?input.terms:'Not specified',
     status:statuses[0]?.name || 'Submitted', owner:'Finance Review Queue', requester:user.name,
     due:due.toISOString().slice(0,10), submitted:today.toISOString().slice(0,10), coface:'—', approved:null,
-    note:typeof input.note==='string'?input.note.slice(0,2000):'', docs:Array.isArray(input.docs)?input.docs.map(Boolean):[],
+    note:typeof input.note==='string'?input.note.slice(0,2000):'', docs:[],
     history:[`Request submitted by ${user.name}`] };
   db.prepare(`INSERT INTO requests (id,buyer,country,business_unit,amount,currency,payment_terms,status,owner,requester,due_date,submitted_date,coface_reference,approved_amount,note,documents_json,history_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(request.id,request.buyer,request.country,request.unit,request.amount,request.currency,request.terms,request.status,request.owner,request.requester,request.due,request.submitted,request.coface,request.approved,request.note,JSON.stringify(request.docs),JSON.stringify(request.history));
@@ -325,6 +386,22 @@ async function api(req,res,url) {
     const events=addComment(user,id,await readBody(req));
     audit(req,user,'request.comment','success',{resourceId:id});
     return send(res,201,events);
+  }
+  const uploadMatch=url.pathname.match(/^\/api\/requests\/([^/]+)\/documents$/);
+  if (req.method==='POST' && uploadMatch) {
+    const id=decodeURIComponent(uploadMatch[1]);
+    const uploaded=await uploadDocument(req,user,id,url.searchParams.get('doc'));
+    audit(req,user,'document.upload','success',{resourceId:id,details:{documentId:uploaded.id,docIndex:uploaded.docIndex,size:uploaded.size}});
+    return send(res,201,uploaded);
+  }
+  const downloadMatch=url.pathname.match(/^\/api\/documents\/(\d+)$/);
+  if (req.method==='GET' && downloadMatch) {
+    const doc=documentForDownload(user,Number(downloadMatch[1]));
+    audit(req,user,'document.download','success',{resourceId:doc.request_id,details:{documentId:doc.id}});
+    res.writeHead(200,{ 'Content-Type':'application/pdf', 'Content-Length':String(doc.size), 'Cache-Control':'no-store',
+      'Content-Disposition':`attachment; filename="${doc.original_name.replace(/"/g,'')}"`,
+      'Content-Security-Policy':"default-src 'none'; sandbox", ...securityHeaders(req) });
+    return fs.createReadStream(path.join(DOCS_DIR, doc.stored_name)).pipe(res);
   }
   if (req.method==='POST' && url.pathname==='/api/requests') {
     requireRole(user,['Business Requester','Administrator']);
