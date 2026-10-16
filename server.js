@@ -106,6 +106,11 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_request_documents_request ON request_documents(request_id);
 `);
+// Additive column migrations for databases created by earlier versions.
+function addColumnIfMissing(table, column, definition) {
+  if (!db.prepare(`PRAGMA table_info(${table})`).all().some(c=>c.name===column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+addColumnIfMissing('requests','return_status','TEXT');
 
 const seed = {
   statuses: [
@@ -345,18 +350,47 @@ function createRequest(input, user) {
   addNotification({eventKey:`created:${request.id}`,role:'Finance Reviewer',requestId:request.id,type:'new_request',title:'New credit insurance request',message:`${request.id} - ${request.buyer} has been submitted for finance review.`});
   return request;
 }
+function needsRequesterAction(status) { return status.includes('Documents Required') || status.includes('Information Required'); }
+function notifyFinance(row, notice) {
+  if (row.owner && row.owner !== 'Finance Review Queue') addNotification({ ...notice, user:row.owner });
+  else addNotification({ ...notice, role:'Finance Reviewer' });
+}
+function respondToRequest(user, id, input) {
+  const row = accessibleRequest(user, id);
+  if (row.requester !== user.name) throw Object.assign(new Error('Only the requester can respond to this request'),{status:403});
+  if (!needsRequesterAction(row.status)) throw Object.assign(new Error('This request is not waiting for your response'),{status:409});
+  const comment = typeof input.comment === 'string' ? input.comment.trim() : '';
+  if (comment.length > 2000) throw Object.assign(new Error('Comment must be 2000 characters or fewer'),{status:400});
+  if (row.status.includes('Documents Required')) {
+    const checklist = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='documents'").get().value_json);
+    const received = new Set(getDocuments(id).map(doc=>doc.docIndex));
+    const missing = checklist.map((doc,i)=>({...doc,i})).filter(doc=>doc.required && !received.has(doc.i)).map(doc=>doc.name);
+    if (missing.length) throw Object.assign(new Error(`Upload the required documents first: ${missing.join(', ')}`),{status:400});
+  }
+  const statuses = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='statuses'").get().value_json).map(s=>s.name);
+  const target = row.return_status && statuses.includes(row.return_status) ? row.return_status : statuses[0];
+  if (comment) addEvent(id, user.name, 'comment', comment);
+  const history = parseJson(row.history_json); history.unshift(`Requester responded; status changed to ${target}`);
+  db.prepare('UPDATE requests SET status=?, history_json=?, return_status=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(target,JSON.stringify(history),id);
+  addEvent(id, user.name, 'status', `Responded and returned to Finance (${row.status} to ${target})`);
+  notifyFinance(row, { eventKey:`respond:${id}:${Date.now()}`, requestId:id, type:'requester_response', title:'Requester responded',
+    message:`${id} - ${row.buyer} is back with Finance at ${target}.${comment ? ` "${comment.length>100?comment.slice(0,97)+'...':comment}"` : ''}` });
+  return mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));
+}
 function updateStatus(id, status, user) {
   const allowed = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='statuses'").get().value_json).map(s=>s.name);
   if (!allowed.includes(status)) throw Object.assign(new Error('Unknown workflow status'),{status:400});
   const row = db.prepare('SELECT * FROM requests WHERE id=?').get(id);
   if (!row) throw Object.assign(new Error('Request not found'),{status:404});
   const history = parseJson(row.history_json); history.unshift(`Status changed to ${status}`);
-  db.prepare("UPDATE requests SET status=?, history_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status,JSON.stringify(history),id);
+  // Remember where the request came from so the requester's response can return it there.
+  const returnStatus = needsRequesterAction(status) && !needsRequesterAction(row.status) ? row.status : row.return_status;
+  db.prepare("UPDATE requests SET status=?, history_json=?, return_status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status,JSON.stringify(history),returnStatus,id);
   addEvent(id, user.name, 'status', `Status changed from ${row.status} to ${status}`);
   const changed=mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));
   const eventTime=Date.now();
   addNotification({eventKey:`status:${id}:${eventTime}`,user:changed.requester,requestId:id,type:'status_change',title:'Request stage updated',message:`${id} - ${changed.buyer} moved from ${row.status} to ${status}.`});
-  if (status.includes('Documents Required') || status.includes('Information Required')) addNotification({eventKey:`action:${id}:${eventTime}`,user:changed.requester,requestId:id,type:'action_required',title:'Action required',message:`${id} - ${changed.buyer} requires additional information or documents.`});
+  if (needsRequesterAction(status)) addNotification({eventKey:`action:${id}:${eventTime}`,user:changed.requester,requestId:id,type:'action_required',title:'Action required',message:`${id} - ${changed.buyer} requires additional information or documents.`});
   return changed;
 }
 
@@ -393,6 +427,13 @@ async function api(req,res,url) {
     const uploaded=await uploadDocument(req,user,id,url.searchParams.get('doc'));
     audit(req,user,'document.upload','success',{resourceId:id,details:{documentId:uploaded.id,docIndex:uploaded.docIndex,size:uploaded.size}});
     return send(res,201,uploaded);
+  }
+  const respondMatch=url.pathname.match(/^\/api\/requests\/([^/]+)\/respond$/);
+  if (req.method==='POST' && respondMatch) {
+    const id=decodeURIComponent(respondMatch[1]);
+    const changed=respondToRequest(user,id,await readBody(req));
+    audit(req,user,'request.respond','success',{resourceId:id,details:{status:changed.status}});
+    return send(res,200,changed);
   }
   const downloadMatch=url.pathname.match(/^\/api\/documents\/(\d+)$/);
   if (req.method==='GET' && downloadMatch) {

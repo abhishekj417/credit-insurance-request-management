@@ -159,3 +159,40 @@ test('sanitises uploaded file names', async () => {
   assert.ok(uploaded.name.endsWith('.pdf'));
   assert.ok(!uploaded.name.startsWith('.'));
 });
+
+test('requester answers a documents request and it returns to the stage it came from', async () => {
+  const created = await newRequest(requesterA,'Respond Buyer');
+  await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Documents Under Review' });
+  await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Returned—Documents Required' });
+  // Required checklist items (0 and 1) must be uploaded first.
+  const blocked = await post(`/api/requests/${created.id}/respond`, requesterA, { comment:'Done' });
+  assert.equal(blocked.status,400);
+  assert.match((await blocked.json()).error,/Trade \/ commercial licence/);
+  await upload(created.id, requesterA, pdf, { doc:0 });
+  await upload(created.id, requesterA, pdf, { doc:1 });
+  const response = await post(`/api/requests/${created.id}/respond`, requesterA, { comment:'Both documents uploaded.' });
+  assert.equal(response.status,200);
+  assert.equal((await response.json()).status,'Documents Under Review');
+  const detail = await (await api(`/api/requests/${created.id}`, reviewer)).json();
+  assert.ok(detail.events.some(e=>e.type==='comment' && e.message==='Both documents uploaded.'));
+  const notices = await (await api('/api/notifications', reviewer)).json();
+  assert.ok(notices.some(n=>n.requestId===created.id && n.type==='requester_response'));
+  // It can only be answered once, while it is waiting on the requester.
+  assert.equal((await post(`/api/requests/${created.id}/respond`, requesterA, {})).status,409);
+});
+
+test('information requests from the COFACE stage return to that stage', async () => {
+  const created = await newRequest(requesterA,'COFACE Info Buyer');
+  await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Submitted to COFACE' });
+  await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Additional Information Required' });
+  const response = await post(`/api/requests/${created.id}/respond`, requesterA, { comment:'Buyer has 12 years trading history.' });
+  assert.equal(response.status,200);
+  assert.equal((await response.json()).status,'Submitted to COFACE');
+});
+
+test('only the requester can respond', async () => {
+  const created = await newRequest(requesterA,'Respond Permissions Buyer');
+  await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Additional Information Required' });
+  assert.equal((await post(`/api/requests/${created.id}/respond`, requesterB, {})).status,404);
+  assert.equal((await post(`/api/requests/${created.id}/respond`, reviewer, {})).status,403);
+});
