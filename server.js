@@ -377,16 +377,27 @@ function respondToRequest(user, id, input) {
     message:`${id} - ${row.buyer} is back with Finance at ${target}.${comment ? ` "${comment.length>100?comment.slice(0,97)+'...':comment}"` : ''}` });
   return mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));
 }
-function updateStatus(id, status, user) {
+function updateStatus(id, status, user, outcome={}) {
   const allowed = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='statuses'").get().value_json).map(s=>s.name);
   if (!allowed.includes(status)) throw Object.assign(new Error('Unknown workflow status'),{status:400});
   const row = db.prepare('SELECT * FROM requests WHERE id=?').get(id);
   if (!row) throw Object.assign(new Error('Request not found'),{status:404});
+  const hasReference = outcome.cofaceReference !== undefined && outcome.cofaceReference !== null && outcome.cofaceReference !== '';
+  if (hasReference && !validText(outcome.cofaceReference, 100)) throw Object.assign(new Error('COFACE reference must be 100 characters or fewer'),{status:400});
+  const cofaceReference = hasReference ? outcome.cofaceReference.trim() : row.coface_reference;
+  let approvedAmount = row.approved_amount;
+  if (status === 'Approved') {
+    // A COFACE approval must carry its reference and the amount actually granted.
+    approvedAmount = Number(outcome.approvedAmount);
+    if (!Number.isFinite(approvedAmount) || approvedAmount <= 0) throw Object.assign(new Error('Enter the approved credit limit to approve this request'),{status:400});
+    if (!cofaceReference || cofaceReference === '—') throw Object.assign(new Error('Enter the COFACE reference to approve this request'),{status:400});
+  }
   const history = parseJson(row.history_json); history.unshift(`Status changed to ${status}`);
   // Remember where the request came from so the requester's response can return it there.
   const returnStatus = needsRequesterAction(status) && !needsRequesterAction(row.status) ? row.status : row.return_status;
-  db.prepare("UPDATE requests SET status=?, history_json=?, return_status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status,JSON.stringify(history),returnStatus,id);
-  addEvent(id, user.name, 'status', `Status changed from ${row.status} to ${status}`);
+  db.prepare("UPDATE requests SET status=?, history_json=?, return_status=?, coface_reference=?, approved_amount=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status,JSON.stringify(history),returnStatus,cofaceReference,approvedAmount,id);
+  const outcomeNote = status === 'Approved' ? ` (COFACE ${cofaceReference}, approved ${row.currency} ${approvedAmount.toLocaleString('en-US')})` : hasReference ? ` (COFACE reference ${cofaceReference})` : '';
+  addEvent(id, user.name, 'status', `Status changed from ${row.status} to ${status}${outcomeNote}`);
   const changed=mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));
   const eventTime=Date.now();
   addNotification({eventKey:`status:${id}:${eventTime}`,user:changed.requester,requestId:id,type:'status_change',title:'Request stage updated',message:`${id} - ${changed.buyer} moved from ${row.status} to ${status}.`});
@@ -454,8 +465,9 @@ async function api(req,res,url) {
   if (req.method==='PATCH' && statusMatch) {
     requireRole(user,['Finance Reviewer','Administrator']);
     const id=decodeURIComponent(statusMatch[1]);
-    const changed=updateStatus(id,(await readBody(req)).status,user);
-    audit(req,user,'request.status_change','success',{resourceId:id,details:{status:changed.status}});
+    const body=await readBody(req);
+    const changed=updateStatus(id,body.status,user,{cofaceReference:body.cofaceReference,approvedAmount:body.approvedAmount});
+    audit(req,user,'request.status_change','success',{resourceId:id,details:{status:changed.status,cofaceReference:changed.coface,approvedAmount:changed.approved}});
     return send(res,200,changed);
   }
   const configMatch=url.pathname.match(/^\/api\/config\/(statuses|documents|roles|reminders)$/);

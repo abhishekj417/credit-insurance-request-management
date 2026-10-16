@@ -75,7 +75,7 @@ test('creates and persists a request', async () => {
 test('updates status and records history', async () => {
   const created = await (await createRequest(requesterA,'Status Test Buyer')).json();
   const id = created.id;
-  const response = await api(`/api/requests/${id}/status`, reviewer, { method:'PATCH', body:JSON.stringify({status:'Approved'}) });
+  const response = await api(`/api/requests/${id}/status`, reviewer, { method:'PATCH', body:JSON.stringify({status:'Approved',cofaceReference:'COF-2026-0042',approvedAmount:1500}) });
   const changed = await response.json();
   assert.equal(response.status,200);
   assert.equal(changed.status,'Approved');

@@ -196,3 +196,22 @@ test('only the requester can respond', async () => {
   assert.equal((await post(`/api/requests/${created.id}/respond`, requesterB, {})).status,404);
   assert.equal((await post(`/api/requests/${created.id}/respond`, reviewer, {})).status,403);
 });
+
+test('approval records the COFACE reference and approved limit', async () => {
+  const created = await newRequest(requesterA,'Approval Buyer');
+  const noAmount = await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Approved', cofaceReference:'COF-1' });
+  assert.equal(noAmount.status,400);
+  const noReference = await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Approved', approvedAmount:20000 });
+  assert.equal(noReference.status,400);
+  // The reference can be captured earlier, when the request is sent to COFACE.
+  const submitted = await (await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Submitted to COFACE', cofaceReference:'COF-2026-0099' })).json();
+  assert.equal(submitted.coface,'COF-2026-0099');
+  const approved = await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Approved', approvedAmount:20000 });
+  assert.equal(approved.status,200);
+  const body = await approved.json();
+  assert.equal(body.approved,20000);
+  assert.equal(body.coface,'COF-2026-0099');
+  const detail = await (await api(`/api/requests/${created.id}`, requesterA)).json();
+  assert.match(detail.events[0].message,/COFACE COF-2026-0099, approved AED 20,000/);
+  assert.equal((await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Closed', cofaceReference:'x'.repeat(101) })).status,400);
+});
