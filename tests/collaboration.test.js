@@ -240,3 +240,23 @@ test('finance reviewers take ownership and receive the requester follow-ups', as
   const detail = await (await api(`/api/requests/${created.id}`, admin)).json();
   assert.deepEqual(detail.events.filter(e=>e.type==='assignment').map(e=>e.actor),['Finance User','Finance User']);
 });
+
+function expectedDue(days) {
+  const date = new Date(); const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  let remaining = days;
+  while (remaining > 0) { d.setUTCDate(d.getUTCDate()+1); if (d.getUTCDay() !== 0 && d.getUTCDay() !== 6) remaining--; }
+  return d.toISOString().slice(0,10);
+}
+
+test('due dates follow the stage SLA in working days', async () => {
+  const created = await newRequest(requesterA,'SLA Buyer');
+  assert.equal(created.due, expectedDue(1));           // Submitted to Finance: 1 day
+  const reviewing = await (await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Documents Under Review' })).json();
+  assert.equal(reviewing.due, expectedDue(2));         // 2 days
+  const coface = await (await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Submitted to COFACE' })).json();
+  assert.equal(coface.due, expectedDue(5));            // 5 days
+  const closed = await (await patch(`/api/requests/${created.id}/status`, reviewer, { status:'Closed' })).json();
+  assert.equal(closed.due, coface.due);                 // SLA 0 keeps the previous date
+  const due = new Date(`${created.due}T00:00:00Z`).getUTCDay();
+  assert.ok(due !== 0 && due !== 6);
+});

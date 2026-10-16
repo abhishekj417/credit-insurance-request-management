@@ -258,6 +258,13 @@ function getNotifications(user) {
   return db.prepare(`SELECT id,request_id AS requestId,notification_type AS type,title,message,read_at AS readAt,created_at AS createdAt
     FROM notifications WHERE recipient_user=? OR recipient_role IN (${placeholders}) ORDER BY created_at DESC LIMIT 50`).all(user.name,...roles);
 }
+// Working days only (Monday-Friday), matching the UAE working week.
+function addBusinessDays(from, days) {
+  const date = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate()));
+  let remaining = Math.max(0, Math.floor(days));
+  while (remaining > 0) { date.setUTCDate(date.getUTCDate()+1); const day = date.getUTCDay(); if (day !== 0 && day !== 6) remaining--; }
+  return date;
+}
 function processPendingReminders() {
   const pending=db.prepare(`SELECT id,buyer,status,requester FROM requests
     WHERE status NOT IN ('Approved','Rejected','Closed') AND datetime(updated_at) <= datetime('now','-3 days')`).all();
@@ -267,7 +274,14 @@ function processPendingReminders() {
       title:'Request pending for more than 3 days',message:`${request.id} - ${request.buyer} is still at ${request.status}. Review the next required action.`});
     if (request.status.includes('Documents Required') || request.status.includes('Information Required')) addNotification({eventKey:`pending-requester:${request.id}:${period}`,user:request.requester,requestId:request.id,type:'reminder',title:'Your action is pending',message:`${request.id} - ${request.buyer} has been awaiting information for more than 3 days.`});
   }
-  return pending.length;
+  // Past the SLA due date of the current stage: remind whoever holds the next action.
+  const overdue=db.prepare(`SELECT id,buyer,status,requester,owner,due_date FROM requests
+    WHERE status NOT IN ('Approved','Rejected','Closed') AND due_date < date('now')`).all();
+  for (const request of overdue) {
+    const notice={eventKey:`overdue:${request.id}:${period}`,requestId:request.id,type:'reminder',title:'Request past its due date',message:`${request.id} - ${request.buyer} at ${request.status} was due on ${request.due_date}.`};
+    if (needsRequesterAction(request.status)) addNotification({...notice,user:request.requester}); else notifyFinance(request,notice);
+  }
+  return pending.length + overdue.length;
 }
 let lastReminderScan = 0;
 function maybeProcessPendingReminders(now=Date.now()) {
@@ -337,7 +351,7 @@ function createRequest(input, user) {
     throw Object.assign(new Error('Buyer, country, business unit and a positive amount are required'),{status:400});
   }
   const statuses = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='statuses'").get().value_json);
-  const today = new Date(); const due = new Date(today); due.setDate(due.getDate()+1);
+  const today = new Date(); const due = addBusinessDays(today, Math.max(1, Number(statuses[0]?.sla) || 1));
   const request = { id:nextId(), buyer:input.buyer.trim(), country:input.country.trim(), unit:input.unit.trim(), amount:Number(input.amount),
     currency:validText(input.currency,3)?input.currency:'AED', terms:validText(input.terms)?input.terms:'Not specified',
     status:statuses[0]?.name || 'Submitted', owner:'Finance Review Queue', requester:user.name,
@@ -381,18 +395,21 @@ function respondToRequest(user, id, input) {
     const missing = checklist.map((doc,i)=>({...doc,i})).filter(doc=>doc.required && !received.has(doc.i)).map(doc=>doc.name);
     if (missing.length) throw Object.assign(new Error(`Upload the required documents first: ${missing.join(', ')}`),{status:400});
   }
-  const statuses = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='statuses'").get().value_json).map(s=>s.name);
+  const statusConfig = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='statuses'").get().value_json);
+  const statuses = statusConfig.map(s=>s.name);
   const target = row.return_status && statuses.includes(row.return_status) ? row.return_status : statuses[0];
+  const sla = Math.max(1, Number(statusConfig.find(s=>s.name===target)?.sla) || 1);
   if (comment) addEvent(id, user.name, 'comment', comment);
   const history = parseJson(row.history_json); history.unshift(`Requester responded; status changed to ${target}`);
-  db.prepare('UPDATE requests SET status=?, history_json=?, return_status=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(target,JSON.stringify(history),id);
+  db.prepare('UPDATE requests SET status=?, history_json=?, return_status=NULL, due_date=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(target,JSON.stringify(history),addBusinessDays(new Date(), sla).toISOString().slice(0,10),id);
   addEvent(id, user.name, 'status', `Responded and returned to Finance (${row.status} to ${target})`);
   notifyFinance(row, { eventKey:`respond:${id}:${Date.now()}`, requestId:id, type:'requester_response', title:'Requester responded',
     message:`${id} - ${row.buyer} is back with Finance at ${target}.${comment ? ` "${comment.length>100?comment.slice(0,97)+'...':comment}"` : ''}` });
   return mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));
 }
 function updateStatus(id, status, user, outcome={}) {
-  const allowed = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='statuses'").get().value_json).map(s=>s.name);
+  const statusConfig = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='statuses'").get().value_json);
+  const allowed = statusConfig.map(s=>s.name);
   if (!allowed.includes(status)) throw Object.assign(new Error('Unknown workflow status'),{status:400});
   const row = db.prepare('SELECT * FROM requests WHERE id=?').get(id);
   if (!row) throw Object.assign(new Error('Request not found'),{status:404});
@@ -409,7 +426,10 @@ function updateStatus(id, status, user, outcome={}) {
   const history = parseJson(row.history_json); history.unshift(`Status changed to ${status}`);
   // Remember where the request came from so the requester's response can return it there.
   const returnStatus = needsRequesterAction(status) && !needsRequesterAction(row.status) ? row.status : row.return_status;
-  db.prepare("UPDATE requests SET status=?, history_json=?, return_status=?, coface_reference=?, approved_amount=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status,JSON.stringify(history),returnStatus,cofaceReference,approvedAmount,id);
+  // Each stage's SLA (working days) sets the new due date; stages with SLA 0 keep the existing date.
+  const sla = Number(statusConfig.find(s=>s.name===status)?.sla) || 0;
+  const dueDate = sla > 0 ? addBusinessDays(new Date(), sla).toISOString().slice(0,10) : row.due_date;
+  db.prepare("UPDATE requests SET status=?, history_json=?, return_status=?, coface_reference=?, approved_amount=?, due_date=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(status,JSON.stringify(history),returnStatus,cofaceReference,approvedAmount,dueDate,id);
   const outcomeNote = status === 'Approved' ? ` (COFACE ${cofaceReference}, approved ${row.currency} ${approvedAmount.toLocaleString('en-US')})` : hasReference ? ` (COFACE reference ${cofaceReference})` : '';
   addEvent(id, user.name, 'status', `Status changed from ${row.status} to ${status}${outcomeNote}`);
   const changed=mapRequest(db.prepare('SELECT * FROM requests WHERE id=?').get(id));

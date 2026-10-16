@@ -47,13 +47,23 @@ test('rate limits write endpoints per user', async () => {
 test('throttles reminder scans triggered from the notifications endpoint', () => {
   process.env.CREDITFLOW_DB = path.join(tempDir,'reminders.db');
   process.env.AUTH_MODE = 'entra';
-  const { maybeProcessPendingReminders, db } = require('../server.js');
+  const { maybeProcessPendingReminders, processPendingReminders, db } = require('../server.js');
   try {
     const now = Date.now();
     assert.equal(typeof maybeProcessPendingReminders(now),'number');
     assert.equal(maybeProcessPendingReminders(now + 1000),null);
     assert.equal(maybeProcessPendingReminders(now + 60 * 1000),null);
     assert.equal(typeof maybeProcessPendingReminders(now + 6 * 60 * 1000),'number');
+
+    // Requests past their SLA due date remind whoever holds the next action.
+    const insert = db.prepare(`INSERT INTO requests (id,buyer,country,business_unit,amount,currency,payment_terms,status,owner,requester,due_date,submitted_date)
+      VALUES (?,?,?,?,?,?,?,?,?,?,date('now','-2 days'),date('now','-5 days'))`);
+    insert.run('CI-2026-901','Overdue Finance','UAE','Distribution',1000,'AED','30 days','Documents Under Review','Finance User','Requester A');
+    insert.run('CI-2026-902','Overdue Requester','UAE','Distribution',1000,'AED','30 days','Returned—Documents Required','Finance Review Queue','Requester A');
+    processPendingReminders();
+    const reminders = db.prepare("SELECT request_id AS requestId, recipient_user AS user, recipient_role AS role FROM notifications WHERE event_key LIKE 'overdue:%'").all().map(r=>({...r}));
+    assert.deepEqual(reminders.find(r=>r.requestId==='CI-2026-901'),{ requestId:'CI-2026-901', user:'Finance User', role:null });
+    assert.deepEqual(reminders.find(r=>r.requestId==='CI-2026-902'),{ requestId:'CI-2026-902', user:'Requester A', role:null });
   } finally { db.close(); }
 });
 
