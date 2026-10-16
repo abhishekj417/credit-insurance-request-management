@@ -94,7 +94,7 @@ function requestTable(requests) {
 }
 
 function renderRequests() {
-  document.querySelector("#requestsView").innerHTML = `<div class="section-toolbar"><div class="search"><span>⌕</span><input id="requestSearch" placeholder="Search buyer, ID, owner or business unit"></div><select id="statusFilter" class="filter-select"><option value="">All statuses</option>${state.statuses.map(s=>`<option>${esc(s.name)}</option>`).join("")}</select>${isFinance()?'<label class="mine-toggle"><input type="checkbox" id="mineFilter"> Assigned to me</label>':''}</div><div class="panel" id="requestTablePanel">${requestTable(state.requests)}</div>`;
+  document.querySelector("#requestsView").innerHTML = `<div class="section-toolbar"><div class="search"><span>⌕</span><input id="requestSearch" placeholder="Search buyer, ID, owner or business unit"></div><select id="statusFilter" class="filter-select"><option value="">All statuses</option>${state.statuses.map(s=>`<option>${esc(s.name)}</option>`).join("")}</select>${isFinance()?'<label class="mine-toggle"><input type="checkbox" id="mineFilter"> Assigned to me</label>':''}<a class="secondary-button export-link" href="/api/requests/export.csv">Export to Excel (CSV)</a></div><div class="panel" id="requestTablePanel">${requestTable(state.requests)}</div>`;
 }
 
 function renderAdmin() {

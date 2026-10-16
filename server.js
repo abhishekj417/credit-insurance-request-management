@@ -439,6 +439,62 @@ function updateStatus(id, status, user, outcome={}) {
   return changed;
 }
 
+const STATUS_COLORS = ['teal','blue','orange','red','gray'];
+const ROLE_ACCESS = ['Create & view own','View business unit','Review & manage','View all','Full access'];
+function configError(message, status=400) { return Object.assign(new Error(message),{status}); }
+function uniqueNames(items, field) {
+  const names = items.map(item=>item[field].toLowerCase());
+  if (new Set(names).size !== names.length) throw configError('Names must be unique');
+}
+// Validates and normalises admin configuration so a save cannot break the workflow or orphan data.
+function validateConfig(section, value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 50) throw configError('Configuration must contain between 1 and 50 items');
+  if (value.some(item=>!item || typeof item !== 'object' || Array.isArray(item))) throw configError('Every configuration item must be an object');
+  const text = (input, max) => typeof input === 'string' ? input.trim().slice(0, max) : '';
+  if (section === 'statuses') {
+    const items = value.map(item=>({ name:text(item.name,120), color:item.color, sla:Number(item.sla) }));
+    if (items.some(item=>!item.name)) throw configError('Every status needs a name');
+    uniqueNames(items,'name');
+    if (items.some(item=>!STATUS_COLORS.includes(item.color) || !Number.isInteger(item.sla) || item.sla < 0 || item.sla > 90)) throw configError('Every status needs a valid colour and an SLA between 0 and 90 days');
+    if (!['Approved','Rejected','Closed'].every(name=>items.some(item=>item.name===name))) throw configError('Approved, Rejected and Closed are required system stages');
+    const inUse = db.prepare('SELECT DISTINCT status FROM requests').all().map(row=>row.status).filter(status=>!items.some(item=>item.name===status));
+    if (inUse.length) throw configError(`These stages are still used by requests and cannot be removed or renamed: ${inUse.join(', ')}`,409);
+    return items;
+  }
+  if (section === 'documents') {
+    const items = value.map(item=>({ name:text(item.name,120), required:item.required === true }));
+    if (items.some(item=>!item.name)) throw configError('Every document needs a name');
+    uniqueNames(items,'name');
+    // Uploaded files are linked to a checklist position, so positions with uploads must keep their document.
+    const current = parseJson(db.prepare("SELECT value_json FROM settings WHERE section='documents'").get().value_json);
+    const used = db.prepare('SELECT DISTINCT doc_index AS docIndex FROM request_documents').all().map(row=>row.docIndex);
+    const moved = used.filter(i=>current[i] && items[i]?.name !== current[i].name).map(i=>current[i].name);
+    if (moved.length) throw configError(`These documents already have uploads and must stay in place with the same name: ${moved.join(', ')}. Add new documents at the end instead.`,409);
+    return items;
+  }
+  if (section === 'roles') {
+    const items = value.map(item=>({ name:text(item.name,120), access:item.access }));
+    if (items.some(item=>!item.name || !ROLE_ACCESS.includes(item.access))) throw configError('Every role needs a name and a valid access level');
+    uniqueNames(items,'name');
+    return items;
+  }
+  const items = value.map(item=>({ event:text(item.event,200), after:Number(item.after), recipient:text(item.recipient,120) }));
+  if (items.some(item=>!item.event || !item.recipient || !Number.isInteger(item.after) || item.after < 1 || item.after > 365)) throw configError('Every reminder needs an event, a recipient and a delay between 1 and 365 days');
+  return items;
+}
+const CSV_COLUMNS = [['ID','id'],['Buyer','buyer'],['Country','country'],['Business unit','unit'],['Requested amount','amount'],['Currency','currency'],
+  ['Payment terms','terms'],['Status','status'],['Owner','owner'],['Requester','requester'],['Submitted','submitted'],['Due','due'],['COFACE reference','coface'],['Approved amount','approved']];
+function csvCell(value) {
+  let text = value === null || value === undefined ? '' : String(value);
+  // Neutralise spreadsheet formulas (CSV injection) before quoting.
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g,'""')}"`;
+}
+function exportCsv(user) {
+  const rows = getBootstrap(user).requests;
+  const lines = [CSV_COLUMNS.map(([label])=>csvCell(label)).join(','), ...rows.map(row=>CSV_COLUMNS.map(([,key])=>csvCell(row[key])).join(','))];
+  return '\uFEFF' + lines.join('\r\n') + '\r\n';
+}
 async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{status:'ok',database:'connected'});
   const user=getUser(req);
@@ -457,6 +513,14 @@ async function api(req,res,url) {
     return send(res,200,{ok:true});
   }
   if (req.method==='GET' && url.pathname==='/api/bootstrap') return send(res,200,getBootstrap(user));
+  if (req.method==='GET' && url.pathname==='/api/requests/export.csv') {
+    const csv=exportCsv(user);
+    audit(req,user,'request.export','success');
+    res.writeHead(200,{ 'Content-Type':'text/csv; charset=utf-8', 'Cache-Control':'no-store',
+      'Content-Disposition':`attachment; filename="credit-insurance-requests-${new Date().toISOString().slice(0,10)}.csv"`,
+      'Content-Security-Policy':"default-src 'none'; sandbox", ...securityHeaders(req) });
+    return res.end(csv);
+  }
   const detailMatch=url.pathname.match(/^\/api\/requests\/([^/]+)$/);
   if (req.method==='GET' && detailMatch) return send(res,200,getRequestDetail(user,decodeURIComponent(detailMatch[1])));
   const commentMatch=url.pathname.match(/^\/api\/requests\/([^/]+)\/comments$/);
@@ -515,7 +579,7 @@ async function api(req,res,url) {
   const configMatch=url.pathname.match(/^\/api\/config\/(statuses|documents|roles|reminders)$/);
   if (req.method==='PUT' && configMatch) {
     requireRole(user,['Administrator']);
-    const value=await readBody(req); if(!Array.isArray(value)) throw Object.assign(new Error('Configuration must be an array'),{status:400});
+    const value=validateConfig(configMatch[1],await readBody(req));
     db.prepare("UPDATE settings SET value_json=?, updated_at=CURRENT_TIMESTAMP WHERE section=?").run(JSON.stringify(value),configMatch[1]);
     audit(req,user,'config.update','success',{resourceId:configMatch[1],details:{items:value.length}});
     return send(res,200,value);

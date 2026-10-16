@@ -260,3 +260,57 @@ test('due dates follow the stage SLA in working days', async () => {
   const due = new Date(`${created.due}T00:00:00Z`).getUTCDay();
   assert.ok(due !== 0 && due !== 6);
 });
+
+test('admin configuration is validated so a save cannot break the workflow', async () => {
+  const put = (section, body, headers=admin) => api(`/api/config/${section}`, headers, { method:'PUT', body:JSON.stringify(body) });
+  const statuses = (await (await api('/api/bootstrap', admin)).json()).statuses;
+  assert.equal((await put('statuses', statuses.filter(s=>s.name!=='Approved'))).status,400);
+  assert.equal((await put('statuses', [...statuses, { name:'approved', color:'teal', sla:1 }])).status,400);
+  assert.equal((await put('statuses', statuses.map((s,i)=>i===0?{ ...s, color:'purple' }:s))).status,400);
+  assert.equal((await put('statuses', statuses.map((s,i)=>i===0?{ ...s, sla:500 }:s))).status,400);
+  assert.equal((await put('statuses', [])).status,400);
+  assert.equal((await put('statuses', 'not a list')).status,400);
+  // A stage that requests are sitting in cannot be removed.
+  await newRequest(requesterA,'Config Guard Buyer');
+  const removeInUse = await put('statuses', statuses.filter(s=>s.name!=='Submitted to Finance'));
+  assert.equal(removeInUse.status,409);
+  assert.match((await removeInUse.json()).error,/Submitted to Finance/);
+  // Valid changes still save, and unknown fields are dropped.
+  const saved = await put('statuses', statuses.map((s,i)=>i===1?{ ...s, sla:3, extra:'<script>' }:s));
+  assert.equal(saved.status,200);
+  const body = await saved.json();
+  assert.equal(body[1].sla,3);
+  assert.equal(body[1].extra,undefined);
+  assert.equal((await put('roles', [{ name:'Requester', access:'Root' }])).status,400);
+  assert.equal((await put('reminders', [{ event:'x', after:0, recipient:'Finance' }])).status,400);
+  assert.equal((await put('reminders', [{ event:'Late', after:2, recipient:'Finance' }])).status,200);
+});
+
+test('documents with uploads cannot be renamed or shifted in the checklist', async () => {
+  const put = body => api('/api/config/documents', admin, { method:'PUT', body:JSON.stringify(body) });
+  const created = await newRequest(requesterA,'Checklist Guard Buyer');
+  await upload(created.id, requesterA, pdf, { doc:0 });
+  const docs = (await (await api('/api/bootstrap', admin)).json()).documents;
+  const shifted = await put(docs.slice(1));
+  assert.equal(shifted.status,409);
+  assert.match((await shifted.json()).error,/Trade \/ commercial licence/);
+  assert.equal((await put([...docs, { name:'Bank reference letter', required:false }])).status,200);
+  assert.equal((await put(docs.map((d,i)=>i===2?{ ...d, required:true }:d))).status,200);
+});
+
+test('exports the requests the caller can see as CSV, safe for Excel', async () => {
+  const created = await newRequest(requesterA,'=HYPERLINK("http://evil.example","Click")');
+  const other = await newRequest(requesterB,'Requester B Export Buyer');
+  const response = await fetch(`${base}/api/requests/export.csv`, { headers:requesterA });
+  assert.equal(response.status,200);
+  assert.match(response.headers.get('content-type'),/^text\/csv/);
+  assert.match(response.headers.get('content-disposition'),/^attachment; filename="credit-insurance-requests-\d{4}-\d{2}-\d{2}\.csv"$/);
+  const csv = await response.text();
+  assert.match(csv.split('\r\n')[0],/"ID","Buyer","Country"/);
+  assert.ok(csv.includes(created.id));
+  assert.ok(!csv.includes(other.id));
+  assert.ok(csv.includes(`"'=HYPERLINK(""http://evil.example"",""Click"")"`));
+  const financeCsv = await (await fetch(`${base}/api/requests/export.csv`, { headers:reviewer })).text();
+  assert.ok(financeCsv.includes(created.id) && financeCsv.includes(other.id));
+  assert.equal((await fetch(`${base}/api/requests/export.csv`)).status,401);
+});
